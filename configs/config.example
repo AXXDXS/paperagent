@@ -1,0 +1,5 @@
+# Local-only LLM configuration. Copy this file to configs/config and replace
+# the placeholder; configs/config is ignored by Git and must be chmod 600.
+REPRO_AGENT_API_KEY=replace-with-your-api-key
+REPRO_AGENT_API_BASE=https://api.openai.com/v1
+REPRO_AGENT_MODEL=gpt-4o-mini

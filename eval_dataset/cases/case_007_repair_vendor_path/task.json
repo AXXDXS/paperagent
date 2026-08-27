@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_007_repair_vendor_path",
+  "title": "Repair a vendored Python module path",
+  "category": "repair",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/repair_vendor_path/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/repair_vendor_path/repository",
+  "target_experiment": "Evaluate the deterministic classifier and report F1 score without downloading packages.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "run_experiment.py", "--output", "{output}/metrics.json"],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/metrics.json"]
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 120},
+  "known_challenge": "metric_utils exists under vendor/ but is not on Python's default import path."
+}

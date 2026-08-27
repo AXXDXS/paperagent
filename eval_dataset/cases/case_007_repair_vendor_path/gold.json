@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "case_id": "case_007_repair_vendor_path",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED"],
+  "expected_observed_metrics": {
+    "f1_score": {"value": 0.88, "tolerance_type": "absolute", "tolerance": 0.000001}
+  },
+  "paper_metrics": {"f1_score": 0.88},
+  "paper_acceptance": [{"metric": "f1_score", "operator": "==", "value": 0.88}],
+  "key_parameters": {
+    "threshold": {"aliases": ["threshold", "decision_threshold"], "value": 0.5},
+    "num_examples": {"aliases": ["num_examples", "evaluation_samples"], "value": 25}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "Accept PYTHONPATH=vendor or an equivalent local import repair; network installation is unnecessary."
+}

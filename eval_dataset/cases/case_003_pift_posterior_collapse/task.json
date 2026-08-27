@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "case_id": "case_003_pift_posterior_collapse",
+  "title": "PIFT posterior collapse as beta increases",
+  "category": "direct",
+  "source_kind": "real_workspace",
+  "paper_path": "paper-replication-paper-main/case_studies/run_1/pift/latex_paper/main.tex",
+  "repository_path": "paper-replication-paper-main/case_studies/run_1/pift",
+  "target_experiment": "Reproduce the Example 1 posterior-collapse figure and verify monotonic uncertainty reduction across beta values.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": [
+      "python3", "scripts/run_target.py", "--target-id", "fig_ex1_posterior_collapse",
+      "--output-path", "{output}/fig_ex1_posterior_collapse.png",
+      "--metrics-path", "{output}/metrics.json"
+    ],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/fig_ex1_posterior_collapse.png"]
+  },
+  "inputs": {
+    "dataset_paths": [],
+    "model_paths": [],
+    "checkpoint_paths": []
+  },
+  "resources": {"cpu": 4, "gpu": 0, "memory_gb": 8},
+  "budget": {"max_runtime_seconds": 1800},
+  "known_challenge": "The claim is a trend over four beta values, not a single loss value."
+}

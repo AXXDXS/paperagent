@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_009_synthetic_metric_gap",
+  "title": "Detect a deterministic metric gap",
+  "category": "gap",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/synthetic_metric_gap/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/synthetic_metric_gap/repository",
+  "target_experiment": "Execute the frozen classifier evaluation and compare observed accuracy with the paper value using absolute tolerance 0.02.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "evaluate.py", "--output", "{output}/metrics.json"],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/metrics.json"]
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 120},
+  "known_challenge": "Execution succeeds but the observed accuracy is outside the paper tolerance."
+}

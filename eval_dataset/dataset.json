@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "name": "reproagent-project-eval-v1",
+  "description": "A small project-specific dataset for regression-testing ReproAgent behavior.",
+  "path_base": "../..",
+  "cases": [
+    {
+      "case_id": "case_001_sindy_linear",
+      "category": "direct",
+      "difficulty": "easy",
+      "source_kind": "real_workspace",
+      "case_path": "cases/case_001_sindy_linear"
+    },
+    {
+      "case_id": "case_002_direct_nested_metrics",
+      "category": "direct",
+      "difficulty": "medium",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_002_direct_nested_metrics"
+    },
+    {
+      "case_id": "case_003_pift_posterior_collapse",
+      "category": "direct",
+      "difficulty": "medium",
+      "source_kind": "real_workspace",
+      "case_path": "cases/case_003_pift_posterior_collapse"
+    },
+    {
+      "case_id": "case_004_direct_cli_parameters",
+      "category": "direct",
+      "difficulty": "hard",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_004_direct_cli_parameters"
+    },
+    {
+      "case_id": "case_005_repair_entrypoint",
+      "category": "repair",
+      "difficulty": "easy",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_005_repair_entrypoint"
+    },
+    {
+      "case_id": "case_006_repair_config",
+      "category": "repair",
+      "difficulty": "easy",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_006_repair_config"
+    },
+    {
+      "case_id": "case_007_repair_vendor_path",
+      "category": "repair",
+      "difficulty": "medium",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_007_repair_vendor_path"
+    },
+    {
+      "case_id": "case_008_synthetic_trend_gap",
+      "category": "gap",
+      "difficulty": "hard",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_008_synthetic_trend_gap"
+    },
+    {
+      "case_id": "case_009_synthetic_metric_gap",
+      "category": "gap",
+      "difficulty": "easy",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_009_synthetic_metric_gap"
+    },
+    {
+      "case_id": "case_010_missing_dataset",
+      "category": "blocked",
+      "difficulty": "easy",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_010_missing_dataset"
+    },
+    {
+      "case_id": "case_011_missing_checkpoint",
+      "category": "blocked",
+      "difficulty": "easy",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_011_missing_checkpoint"
+    },
+    {
+      "case_id": "case_012_invalid_pdf",
+      "category": "invalid_input",
+      "difficulty": "easy",
+      "source_kind": "synthetic",
+      "case_path": "cases/case_012_invalid_pdf"
+    }
+  ]
+}

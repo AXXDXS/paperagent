@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_012_invalid_pdf",
+  "title": "Reject a malformed PDF input",
+  "category": "invalid_input",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/invalid_input/not_a_paper.pdf",
+  "repository_path": "paper_agent/eval_dataset/fixtures/invalid_input/repository",
+  "target_experiment": "Validate the paper input before attempting experiment reproduction.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "does_not_apply.py"],
+    "metrics_output_path": null,
+    "expected_artifacts": []
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 30},
+  "known_challenge": "The .pdf extension is misleading; the file lacks a valid PDF header and must fail input validation."
+}

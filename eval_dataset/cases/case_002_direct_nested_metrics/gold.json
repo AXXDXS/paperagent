@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "case_id": "case_002_direct_nested_metrics",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED"],
+  "expected_observed_metrics": {
+    "clean.accuracy": {"value": 0.92, "tolerance_type": "absolute", "tolerance": 0.01},
+    "noisy.accuracy": {"value": 0.86, "tolerance_type": "absolute", "tolerance": 0.01}
+  },
+  "paper_metrics": {"clean.accuracy": 0.92, "noisy.accuracy": 0.86},
+  "paper_acceptance": [
+    {"metric": "clean.accuracy", "operator": "absolute_difference<=", "value": 0.01},
+    {"metric": "noisy.accuracy", "operator": "absolute_difference<=", "value": 0.01}
+  ],
+  "key_parameters": {
+    "seed": {"aliases": ["seed", "random_seed"], "value": 37},
+    "num_examples_per_branch": {"aliases": ["num_examples_per_branch", "num_examples"], "value": 50}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "Both branches must survive metrics ingestion and appear in the report."
+}

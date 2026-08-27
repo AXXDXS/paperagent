@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "case_id": "case_012_invalid_pdf",
+  "success_expected": false,
+  "requires_real_execution": false,
+  "expected_job_statuses": ["FAILED"],
+  "expected_reproduction_statuses": [null, "NOT_REPRODUCED"],
+  "expected_observed_metrics": {},
+  "paper_metrics": {},
+  "key_parameters": {},
+  "required_evidence": ["input_error"],
+  "notes": "The repository must not be executed after paper parsing fails."
+}

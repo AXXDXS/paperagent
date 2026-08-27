@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# ReproAgent runtime state and potentially large experiment artifacts
+/repro_agent_workdir/
+/repro_agent_demo_output/
+repro_agent.db*
+/sandbox/
+/context_snapshots/
+/project_memory/
+/conda_envs/
+*.log
+examples/demo/repository/output/
+
+# Local credentials and manual test inputs must never be committed
+configs/*
+!configs/config.example
+human_test/
+
+# Generated reports, temporary rendering files, and local research inputs
+/output/
+/tmp/
+/pdf/

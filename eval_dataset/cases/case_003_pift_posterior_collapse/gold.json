@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "case_id": "case_003_pift_posterior_collapse",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED", "TREND_REPRODUCED"],
+  "expected_observed_metrics": {
+    "std_monotone": {"value": 1.0, "tolerance_type": "exact", "tolerance": 0.0},
+    "std_ratio_beta1e5_to_1e2": {"value": 0.027936342799409077, "tolerance_type": "absolute", "tolerance": 0.015},
+    "mean_rel_l2_beta1e5": {"value": 0.00251618338374966, "tolerance_type": "absolute", "tolerance": 0.005}
+  },
+  "paper_metrics": {},
+  "paper_acceptance": [
+    {"metric": "std_monotone", "operator": "==", "value": 1.0},
+    {"metric": "std_ratio_beta1e5_to_1e2", "operator": "<=", "value": 0.25},
+    {"metric": "mean_rel_l2_beta1e5", "operator": "<=", "value": 0.015}
+  ],
+  "key_parameters": {
+    "betas": {"aliases": ["betas", "beta_values"], "value": [100, 1000, 10000, 100000]},
+    "seed": {"aliases": ["seed", "random_seed"], "value": 1234},
+    "num_terms": {"aliases": ["num_terms", "basis_terms"], "value": 20},
+    "thinning": {"aliases": ["thinning", "thin"], "value": 50}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "Trend correctness is represented by std_monotone and the endpoint standard-deviation ratio."
+}

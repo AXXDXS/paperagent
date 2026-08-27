@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_006_repair_config",
+  "title": "Repair a typed configuration value",
+  "category": "repair",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/repair_config/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/repair_config/repository",
+  "target_experiment": "Run the configuration-driven scoring experiment and verify final_score.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "run_experiment.py", "--config", "config.json", "--output", "{output}/metrics.json"],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/metrics.json"]
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 120},
+  "known_challenge": "The archived multiplier is a word rather than the numeric value specified by the paper."
+}

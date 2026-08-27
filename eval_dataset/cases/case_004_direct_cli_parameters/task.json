@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "case_id": "case_004_direct_cli_parameters",
+  "title": "Use paper-specified CLI parameters",
+  "category": "direct",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/direct_cli_parameters/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/direct_cli_parameters/repository",
+  "target_experiment": "Run seeded regression with the paper's seed and evaluation sample count, then verify RMSE.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": [
+      "python3", "experiment.py", "--seed", "41", "--samples", "64",
+      "--output", "{output}/metrics.json"
+    ],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/metrics.json"]
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 120},
+  "known_challenge": "The seed and sample count must be propagated from the paper to the actual command and final specification."
+}

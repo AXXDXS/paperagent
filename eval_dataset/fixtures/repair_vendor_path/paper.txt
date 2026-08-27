@@ -1,0 +1,5 @@
+Experiment: binary classifier evaluation
+
+The deterministic test split has 25 examples. The vendored metric implementation
+produces f1_score=0.88 with threshold=0.50. No package download is required; the
+repository includes the necessary utility module.

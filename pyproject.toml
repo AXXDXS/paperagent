@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repro-agent"
+version = "0.1.0"
+description = "ReproAgent - 论文实验自动复现多智能体系统"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = [
+    "pypdf>=4.2",
+]
+
+[project.scripts]
+repro-agent = "repro_agent.cli.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["repro_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

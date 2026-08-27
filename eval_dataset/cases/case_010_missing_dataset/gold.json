@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "case_id": "case_010_missing_dataset",
+  "success_expected": false,
+  "requires_real_execution": false,
+  "expected_job_statuses": ["BLOCKED_BY_MISSING_RESOURCE", "WAITING_FOR_USER_DATA"],
+  "expected_reproduction_statuses": ["BLOCKED_BY_MISSING_RESOURCE"],
+  "expected_observed_metrics": {},
+  "paper_metrics": {},
+  "key_parameters": {},
+  "required_evidence": ["resource_blocker"],
+  "notes": "The report should identify inputs/eval.csv. It must not invent, download, or replace the dataset."
+}

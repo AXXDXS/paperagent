@@ -1,0 +1,5 @@
+Experiment: resource-dependent evaluation
+
+The evaluation program requires both a CSV dataset and a model checkpoint. It must
+not synthesize, download, or silently replace either input. If a required resource
+is absent, report the exact missing path and stop before claiming reproduction.

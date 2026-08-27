@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "case_id": "case_004_direct_cli_parameters",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED"],
+  "expected_observed_metrics": {
+    "rmse": {"value": 0.03, "tolerance_type": "absolute", "tolerance": 0.000001}
+  },
+  "paper_metrics": {"rmse": 0.03},
+  "paper_acceptance": [{"metric": "rmse", "operator": "absolute_difference<=", "value": 0.005}],
+  "key_parameters": {
+    "seed": {"aliases": ["seed", "random_seed"], "value": 41},
+    "num_samples": {"aliases": ["num_samples", "samples", "evaluation_samples"], "value": 64}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "This case catches agents that extract parameters correctly but fail to apply them to execution."
+}

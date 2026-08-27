@@ -1,0 +1,2 @@
+This file deliberately has a .pdf extension but is plain UTF-8 text.
+The evaluator should reject it as an invalid paper input.

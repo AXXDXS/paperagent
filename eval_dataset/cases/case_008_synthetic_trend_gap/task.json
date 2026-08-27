@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_008_synthetic_trend_gap",
+  "title": "Detect a failed optimization trend",
+  "category": "gap",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/synthetic_trend_gap/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/synthetic_trend_gap/repository",
+  "target_experiment": "Execute the three-stage optimization and verify monotonic loss reduction and final loss.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "train.py", "--output", "{output}/metrics.json"],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/metrics.json"]
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 120},
+  "known_challenge": "The program exits successfully, but its loss curve violates both paper acceptance predicates."
+}

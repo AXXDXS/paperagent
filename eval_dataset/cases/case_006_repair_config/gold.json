@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_006_repair_config",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED"],
+  "expected_observed_metrics": {
+    "final_score": {"value": 0.8, "tolerance_type": "absolute", "tolerance": 0.000001}
+  },
+  "paper_metrics": {"final_score": 0.8},
+  "paper_acceptance": [{"metric": "final_score", "operator": "==", "value": 0.8}],
+  "key_parameters": {
+    "base_score": {"aliases": ["base_score"], "value": 0.4},
+    "multiplier": {"aliases": ["multiplier"], "value": 2.0},
+    "seed": {"aliases": ["seed", "random_seed"], "value": 23}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "The smallest valid repair changes multiplier from the string 'two' to numeric 2.0 in a staged repository."
+}

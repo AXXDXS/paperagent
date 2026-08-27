@@ -1,0 +1,262 @@
+"""系统级枚举定义。
+
+对应设计文档章节：
+- 第 2 节《复现成功的定义》：复现状态 ReproductionStatus
+- 第 9.3 节：资源状态 ResourceStatus
+- 第 9.4 节：字段来源 FieldProvenance
+- 第 11.6 节：审计结果类型 AuditResultType
+- 第 13.1 节：任务状态 TaskStatus
+- 第 14 节：错误类型 FailureType
+- 第 17 节：Job 总体状态机 JobStatus
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class JobStatus(str, Enum):
+    """Job 总体状态机（设计文档 §17）。"""
+
+    JOB_CREATED = "JOB_CREATED"
+    PAPER_ANALYSIS_RUNNING = "PAPER_ANALYSIS_RUNNING"
+    CODE_ANALYSIS_RUNNING = "CODE_ANALYSIS_RUNNING"
+    EXPERIMENT_TARGET_DEFINED = "EXPERIMENT_TARGET_DEFINED"
+    RESOURCE_CHECK_RUNNING = "RESOURCE_CHECK_RUNNING"
+    WAITING_FOR_USER_DATA = "WAITING_FOR_USER_DATA"
+    WAITING_FOR_MODEL = "WAITING_FOR_MODEL"
+    WAITING_FOR_PERMISSION = "WAITING_FOR_PERMISSION"
+    RESOURCES_READY = "RESOURCES_READY"
+    EXPERIMENT_SPEC_READY = "EXPERIMENT_SPEC_READY"
+    ENVIRONMENT_BUILDING = "ENVIRONMENT_BUILDING"
+    ENVIRONMENT_READY = "ENVIRONMENT_READY"
+    UNIT_TEST_RUNNING = "UNIT_TEST_RUNNING"
+    UNIT_TEST_PASSED = "UNIT_TEST_PASSED"
+    SMOKE_TEST_RUNNING = "SMOKE_TEST_RUNNING"
+    SMOKE_TEST_PASSED = "SMOKE_TEST_PASSED"
+    REDUCED_EXPERIMENT_RUNNING = "REDUCED_EXPERIMENT_RUNNING"
+    REDUCED_EXPERIMENT_PASSED = "REDUCED_EXPERIMENT_PASSED"
+    FULL_EXPERIMENT_RUNNING = "FULL_EXPERIMENT_RUNNING"
+    FULL_EXPERIMENT_COMPLETED = "FULL_EXPERIMENT_COMPLETED"
+    RESULT_VERIFICATION_RUNNING = "RESULT_VERIFICATION_RUNNING"
+    RESULT_WITHIN_TOLERANCE = "RESULT_WITHIN_TOLERANCE"
+    RESULT_GAP_DETECTED = "RESULT_GAP_DETECTED"
+    REFLECTION_REQUIRED = "REFLECTION_REQUIRED"
+    REFLECTION_PLANNING = "REFLECTION_PLANNING"
+    AUDIT_RUNNING = "AUDIT_RUNNING"
+    ISSUE_FOUND = "ISSUE_FOUND"
+    REPAIR_RUNNING = "REPAIR_RUNNING"
+    RERUN_REQUIRED = "RERUN_REQUIRED"
+    NO_ISSUE_FOUND = "NO_ISSUE_FOUND"
+    VERIFIED_REPRODUCTION_GAP = "VERIFIED_REPRODUCTION_GAP"
+    USER_REPORT_READY = "USER_REPORT_READY"
+    FULLY_REPRODUCED = "FULLY_REPRODUCED"
+    BLOCKED_BY_MISSING_RESOURCE = "BLOCKED_BY_MISSING_RESOURCE"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+
+
+class ReproductionStatus(str, Enum):
+    """复现结果状态（设计文档 §2）。"""
+
+    ENVIRONMENT_READY = "ENVIRONMENT_READY"
+    PIPELINE_EXECUTABLE = "PIPELINE_EXECUTABLE"
+    SMOKE_TEST_PASSED = "SMOKE_TEST_PASSED"
+    REDUCED_EXPERIMENT_PASSED = "REDUCED_EXPERIMENT_PASSED"
+    FULL_EXPERIMENT_COMPLETED = "FULL_EXPERIMENT_COMPLETED"
+    FULLY_REPRODUCED = "FULLY_REPRODUCED"
+    PARTIALLY_REPRODUCED = "PARTIALLY_REPRODUCED"
+    TREND_REPRODUCED = "TREND_REPRODUCED"
+    PIPELINE_ONLY = "PIPELINE_ONLY"
+    NOT_REPRODUCED = "NOT_REPRODUCED"
+    BLOCKED_BY_MISSING_RESOURCE = "BLOCKED_BY_MISSING_RESOURCE"
+    VERIFIED_REPRODUCTION_GAP = "VERIFIED_REPRODUCTION_GAP"
+
+
+class TaskStatus(str, Enum):
+    """任务状态（设计文档 §13.1）。"""
+
+    PENDING = "PENDING"
+    BLOCKED = "BLOCKED"
+    READY = "READY"
+    DISPATCHED = "DISPATCHED"
+    RUNNING = "RUNNING"
+    # 进程重启后，原本派发/运行中的任务先进入此状态。恢复器必须先
+    # 校验旧 attempt 的持久化输出，才能把它变成 SUCCEEDED 或 PENDING；
+    # 不允许把“进程曾经在跑”直接等同于“任务已经成功”。
+    RECOVERING = "RECOVERING"
+    SUCCEEDED = "SUCCEEDED"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    FAILED_RETRYABLE = "FAILED_RETRYABLE"
+    FAILED_NEEDS_REPLAN = "FAILED_NEEDS_REPLAN"
+    WAITING_FOR_INPUT = "WAITING_FOR_INPUT"
+    WAITING_FOR_USER_DATA = "WAITING_FOR_USER_DATA"
+    WAITING_FOR_PERMISSION = "WAITING_FOR_PERMISSION"
+    SOFT_TIMEOUT = "SOFT_TIMEOUT"
+    HARD_TIMEOUT = "HARD_TIMEOUT"
+    CANCELLED = "CANCELLED"
+    TERMINAL_FAILURE = "TERMINAL_FAILURE"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            TaskStatus.SUCCEEDED,
+            TaskStatus.CANCELLED,
+            TaskStatus.TERMINAL_FAILURE,
+        }
+
+    @property
+    def is_failure(self) -> bool:
+        return self in {
+            TaskStatus.VALIDATION_FAILED,
+            TaskStatus.FAILED_RETRYABLE,
+            TaskStatus.FAILED_NEEDS_REPLAN,
+            TaskStatus.SOFT_TIMEOUT,
+            TaskStatus.HARD_TIMEOUT,
+            TaskStatus.TERMINAL_FAILURE,
+        }
+
+
+class FailureType(str, Enum):
+    """失败类型分类（设计文档 §14）。"""
+
+    TRANSIENT_ERROR = "TRANSIENT_ERROR"
+    TOOL_ERROR = "TOOL_ERROR"
+    INPUT_MISSING = "INPUT_MISSING"
+    PERMISSION_ERROR = "PERMISSION_ERROR"
+    CONTEXT_TOO_LARGE = "CONTEXT_TOO_LARGE"
+    TASK_TOO_BROAD = "TASK_TOO_BROAD"
+    INVALID_OUTPUT = "INVALID_OUTPUT"
+    DEPENDENCY_ERROR = "DEPENDENCY_ERROR"
+    PARSING_ERROR = "PARSING_ERROR"
+    AGENT_STALLED = "AGENT_STALLED"
+    RESOURCE_EXCEEDED = "RESOURCE_EXCEEDED"
+    ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
+    CODE_ERROR = "CODE_ERROR"
+    DATA_ERROR = "DATA_ERROR"
+    MODEL_ERROR = "MODEL_ERROR"
+    TRAINING_ERROR = "TRAINING_ERROR"
+    EVALUATION_ERROR = "EVALUATION_ERROR"
+    UNKNOWN_ERROR = "UNKNOWN_ERROR"
+
+
+class FailureDecision(str, Enum):
+    """主智能体对失败任务的处置决策（设计文档 §19 主循环）。"""
+
+    RETRY = "retry"
+    SPLIT = "split"
+    ADD_PREREQUISITE = "add_prerequisite"
+    ASK_USER = "ask_user"
+    TERMINAL_FAILURE = "terminal_failure"
+
+
+class ToolGrantDecision(str, Enum):
+    """主智能体对"子智能体请求补授缺失工具"的裁决结果。
+
+    工具分配权上收到主智能体后，运行期子智能体遇到"工具已注册但
+    未分配给自己"时不再直接失败，而是升级给主智能体裁决：
+        - GRANT：主智能体判断该任务确实需要此工具且在安全边界内，
+          补授后子智能体**原地继续**当前任务（不重启、不丢上下文）；
+        - DENY：明确不能给——工具未注册、超出任务类型风险预算、
+          被 forbidden_actions 禁止，或主智能体分析后认为不必要；
+        - ASK_USER：主智能体拿不定主意（含 LLM 裁决失败的安全降级），
+          创建人工介入请求，由人类做最终仲裁。
+    """
+
+    GRANT = "grant"
+    DENY = "deny"
+    ASK_USER = "ask_user"
+
+
+class InterventionKind(str, Enum):
+    """需要人工补充的信息或决策类型。"""
+
+    USER_DATA = "USER_DATA"
+    MODEL = "MODEL"
+    RESOURCE = "RESOURCE"
+    PERMISSION = "PERMISSION"
+    COMMAND = "COMMAND"
+    GENERIC = "GENERIC"
+
+
+class InterventionStatus(str, Enum):
+    """人工介入请求的生命周期。"""
+
+    PENDING = "PENDING"
+    RESOLVED = "RESOLVED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
+
+
+class ResourceStatus(str, Enum):
+    """数据/模型/资源状态（设计文档 §9.3）。"""
+
+    AVAILABLE = "AVAILABLE"
+    PARTIALLY_AVAILABLE = "PARTIALLY_AVAILABLE"
+    AVAILABLE_BUT_UNVERIFIED = "AVAILABLE_BUT_UNVERIFIED"
+    RAW_DATA_ONLY = "RAW_DATA_ONLY"
+    PREPROCESSING_REQUIRED = "PREPROCESSING_REQUIRED"
+    VERSION_MISMATCH = "VERSION_MISMATCH"
+    SPLIT_MISMATCH = "SPLIT_MISMATCH"
+    FORMAT_MISMATCH = "FORMAT_MISMATCH"
+    REQUIRES_AUTHORIZATION = "REQUIRES_AUTHORIZATION"
+    REQUIRES_CREDENTIALS = "REQUIRES_CREDENTIALS"
+    RESTRICTED = "RESTRICTED"
+    MISSING = "MISSING"
+    UNKNOWN = "UNKNOWN"
+
+
+class FieldProvenance(str, Enum):
+    """实验规格字段来源（设计文档 §9.4）。"""
+
+    PAPER_EXPLICIT = "PAPER_EXPLICIT"
+    APPENDIX_EXPLICIT = "APPENDIX_EXPLICIT"
+    CODE_DEFAULT = "CODE_DEFAULT"
+    CODE_EFFECTIVE = "CODE_EFFECTIVE"
+    FRAMEWORK_DEFAULT = "FRAMEWORK_DEFAULT"
+    USER_PROVIDED = "USER_PROVIDED"
+    AGENT_INFERRED = "AGENT_INFERRED"
+
+
+class AuditResultType(str, Enum):
+    """审计结果类型（设计文档 §11.6）。"""
+
+    PROCESS_ERROR_CONFIRMED = "PROCESS_ERROR_CONFIRMED"
+    CONFIG_ERROR_CONFIRMED = "CONFIG_ERROR_CONFIRMED"
+    CODE_ERROR_CONFIRMED = "CODE_ERROR_CONFIRMED"
+    DATA_ERROR_CONFIRMED = "DATA_ERROR_CONFIRMED"
+    EVALUATION_ERROR_CONFIRMED = "EVALUATION_ERROR_CONFIRMED"
+    ENVIRONMENT_ERROR_CONFIRMED = "ENVIRONMENT_ERROR_CONFIRMED"
+    RESOURCE_LIMITATION_CONFIRMED = "RESOURCE_LIMITATION_CONFIRMED"
+    RANDOMNESS_LIKELY = "RANDOMNESS_LIKELY"
+    UNDISCLOSED_DETAIL_LIKELY = "UNDISCLOSED_DETAIL_LIKELY"
+    NO_OBVIOUS_ERROR_FOUND = "NO_OBVIOUS_ERROR_FOUND"
+
+
+class RerunScope(str, Enum):
+    """修复后最小重跑范围（设计文档 §11.7）。"""
+
+    EVALUATION_ONLY = "evaluation_only"
+    INFERENCE_AND_EVALUATION = "inference_and_evaluation"
+    FULL_TRAINING = "full_training"
+    ENVIRONMENT_REBUILD = "environment_rebuild"
+
+
+class ExperimentTier(str, Enum):
+    """分级实验层级（设计文档 §10）。"""
+
+    STATIC_CHECK = "static_check"
+    UNIT_TEST = "unit_test"
+    SMOKE_TEST = "smoke_test"
+    REDUCED_EXPERIMENT = "reduced_experiment"
+    FULL_EXPERIMENT = "full_experiment"
+
+
+class ToleranceType(str, Enum):
+    """指标容差类型（设计文档 §11.1）。"""
+
+    ABSOLUTE = "absolute"
+    RELATIVE = "relative"
+    STD_MULTIPLE = "std_multiple"

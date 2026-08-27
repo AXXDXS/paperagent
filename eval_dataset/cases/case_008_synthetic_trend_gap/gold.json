@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "case_id": "case_008_synthetic_trend_gap",
+  "success_expected": false,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["VERIFIED_REPRODUCTION_GAP", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["VERIFIED_REPRODUCTION_GAP", "NOT_REPRODUCED"],
+  "expected_observed_metrics": {
+    "loss_monotone": {"value": 0.0, "tolerance_type": "exact", "tolerance": 0.0},
+    "final_loss": {"value": 0.8, "tolerance_type": "exact", "tolerance": 0.0}
+  },
+  "paper_metrics": {"loss_monotone": 1.0, "final_loss": 0.3},
+  "paper_acceptance": [
+    {"metric": "loss_monotone", "operator": "==", "value": 1.0},
+    {"metric": "final_loss", "operator": "<=", "value": 0.3}
+  ],
+  "key_parameters": {
+    "seed": {"aliases": ["seed", "random_seed"], "value": 43}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "metric_comparison", "container_digest", "repository_commit"],
+  "notes": "The correct final state is a verified gap even though the process exits with code zero."
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "case_id": "case_001_sindy_linear",
+  "title": "SINDy two-dimensional linear system coefficients",
+  "category": "direct",
+  "source_kind": "real_workspace",
+  "paper_path": "paper-replication-paper-main/case_studies/run_1/sindy/latex_paper/arxiv.tex",
+  "repository_path": "paper-replication-paper-main/case_studies/run_1/sindy",
+  "target_experiment": "Reproduce Table 1 for the two-dimensional linear system and verify both support recovery and coefficient error.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "scripts/run_target.py", "--target-id", "tab01_ex1_2d_linear"],
+    "metrics_output_path": "artifacts/tables/comparison/tab01_ex1_2d_linear.json",
+    "expected_artifacts": ["artifacts/tables/tab01_ex1_2d_linear.tex"]
+  },
+  "inputs": {
+    "dataset_paths": [],
+    "model_paths": [],
+    "checkpoint_paths": []
+  },
+  "resources": {"cpu": 2, "gpu": 0, "memory_gb": 4},
+  "budget": {"max_runtime_seconds": 300},
+  "known_challenge": "The metrics are nested under the metrics field in the comparison JSON and some values are encoded as strings."
+}

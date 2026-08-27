@@ -1,0 +1,6 @@
+Experiment: configuration-driven score
+
+The final score is the base score multiplied by a numeric multiplier. The paper
+uses base_score=0.40 and multiplier=2.0, producing final_score=0.80. The random
+seed is 23. A valid reproduction must use a numeric multiplier and save a JSON
+metrics file.

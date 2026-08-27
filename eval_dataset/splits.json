@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "development": [
+    "case_001_sindy_linear",
+    "case_005_repair_entrypoint",
+    "case_008_synthetic_trend_gap",
+    "case_010_missing_dataset",
+    "case_012_invalid_pdf"
+  ],
+  "evaluation": [
+    "case_002_direct_nested_metrics",
+    "case_003_pift_posterior_collapse",
+    "case_004_direct_cli_parameters",
+    "case_006_repair_config",
+    "case_007_repair_vendor_path",
+    "case_009_synthetic_metric_gap",
+    "case_011_missing_checkpoint"
+  ]
+}

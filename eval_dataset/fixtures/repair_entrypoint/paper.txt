@@ -1,0 +1,10 @@
+Experiment: deterministic regression sanity check
+
+The model predicts four held-out targets. With seed 17, the reported mean absolute
+error is 0.020. The experiment must write a JSON metrics artifact containing the
+top-level key `mean_absolute_error`.
+
+Reference parameters:
+- seed: 17
+- number of evaluation samples: 4
+- acceptance rule: mean_absolute_error <= 0.025

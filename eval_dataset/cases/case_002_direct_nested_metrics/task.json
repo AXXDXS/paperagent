@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "case_id": "case_002_direct_nested_metrics",
+  "title": "Read nested clean/noisy metrics",
+  "category": "direct",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/direct_nested_metrics/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/direct_nested_metrics/repository",
+  "target_experiment": "Run the clean/noisy classifier evaluation and verify both accuracy branches.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": ["python3", "evaluate.py", "--output", "{output}/metrics.json"],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": ["{output}/metrics.json"]
+  },
+  "inputs": {"dataset_paths": [], "model_paths": [], "checkpoint_paths": []},
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 120},
+  "known_challenge": "The metrics artifact contains nested clean and noisy objects."
+}

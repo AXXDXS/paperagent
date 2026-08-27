@@ -1,0 +1,5 @@
+Experiment: seeded regression evaluation
+
+Run the regression evaluator with seed=41 and 64 evaluation samples. Under these
+settings the reported root mean squared error is 0.030. The final metrics artifact
+must record the seed and sample count as well as RMSE.

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "case_id": "case_005_repair_entrypoint",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED"],
+  "expected_observed_metrics": {
+    "mean_absolute_error": {"value": 0.02, "tolerance_type": "absolute", "tolerance": 0.000001}
+  },
+  "paper_metrics": {"mean_absolute_error": 0.02},
+  "paper_acceptance": [{"metric": "mean_absolute_error", "operator": "<=", "value": 0.025}],
+  "key_parameters": {
+    "seed": {"aliases": ["seed", "random_seed"], "value": 17},
+    "num_evaluation_samples": {"aliases": ["num_evaluation_samples", "evaluation_samples"], "value": 4}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "A valid repair changes the command to src/run_experiment.py or equivalently invokes that module."
+}

@@ -1,0 +1,5 @@
+Experiment: clean and noisy classification evaluation
+
+Evaluate the fixed classifier with seed=37 on 50 clean and 50 noisy examples.
+The paper reports clean accuracy=0.92 and noisy accuracy=0.86. Both branches are
+required, and absolute numeric variation up to 0.01 is acceptable.

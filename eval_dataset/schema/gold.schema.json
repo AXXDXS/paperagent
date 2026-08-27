@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gold.schema.json",
+  "title": "ReproAgent evaluation gold record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "case_id",
+    "success_expected",
+    "requires_real_execution",
+    "expected_job_statuses",
+    "expected_reproduction_statuses",
+    "expected_observed_metrics",
+    "key_parameters",
+    "required_evidence"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "case_id": {"type": "string"},
+    "success_expected": {"type": "boolean"},
+    "requires_real_execution": {"type": "boolean"},
+    "expected_job_statuses": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "expected_reproduction_statuses": {"type": "array", "minItems": 1, "items": {"type": ["string", "null"]}},
+    "expected_observed_metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value", "tolerance_type", "tolerance"],
+        "properties": {
+          "value": {"type": "number"},
+          "tolerance_type": {"enum": ["absolute", "relative", "exact"]},
+          "tolerance": {"type": "number", "minimum": 0}
+        }
+      }
+    },
+    "paper_metrics": {"type": "object"},
+    "paper_acceptance": {"type": "array"},
+    "key_parameters": {"type": "object"},
+    "required_evidence": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string"}
+  },
+  "additionalProperties": false
+}

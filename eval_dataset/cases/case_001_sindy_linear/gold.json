@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "case_id": "case_001_sindy_linear",
+  "success_expected": true,
+  "requires_real_execution": true,
+  "expected_job_statuses": ["FULLY_REPRODUCED", "USER_REPORT_READY"],
+  "expected_reproduction_statuses": ["FULLY_REPRODUCED"],
+  "expected_observed_metrics": {
+    "support_exact": {"value": 1.0, "tolerance_type": "exact", "tolerance": 0.0},
+    "true_coeff_rel_linf": {"value": 0.0, "tolerance_type": "absolute", "tolerance": 0.000001},
+    "paper_table_max_abs_diff": {"value": 0.0027, "tolerance_type": "absolute", "tolerance": 0.001}
+  },
+  "paper_metrics": {
+    "support_exact": 1.0,
+    "true_coeff_rel_linf": 0.0
+  },
+  "paper_acceptance": [
+    {"metric": "support_exact", "operator": "==", "value": 1.0},
+    {"metric": "true_coeff_rel_linf", "operator": "<=", "value": 0.01}
+  ],
+  "key_parameters": {
+    "dt": {"aliases": ["dt", "time_step"], "value": 0.01},
+    "library_degree": {"aliases": ["library_degree", "polynomial_degree"], "value": 5},
+    "threshold": {"aliases": ["threshold", "sparsity_threshold"], "value": 0.02},
+    "max_iterations": {"aliases": ["max_iterations", "max_iter"], "value": 10}
+  },
+  "required_evidence": ["experiment_log", "metrics_file", "container_digest", "repository_commit"],
+  "notes": "Gold observations come from the checked-in run_1 comparison artifact."
+}

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "case_id": "case_010_missing_dataset",
+  "title": "Stop on a missing evaluation dataset",
+  "category": "blocked",
+  "source_kind": "synthetic",
+  "paper_path": "paper_agent/eval_dataset/fixtures/resource_probe/paper.txt",
+  "repository_path": "paper_agent/eval_dataset/fixtures/resource_probe/repository",
+  "target_experiment": "Evaluate the supplied checkpoint on the required CSV dataset without substituting data.",
+  "run": {
+    "working_directory": "{repository}",
+    "command": [
+      "python3", "evaluate.py", "--dataset", "{repository}/inputs/eval.csv",
+      "--checkpoint", "{repository}/inputs/model.ckpt", "--output", "{output}/metrics.json"
+    ],
+    "metrics_output_path": "{output}/metrics.json",
+    "expected_artifacts": []
+  },
+  "inputs": {
+    "dataset_paths": ["paper_agent/eval_dataset/fixtures/resource_probe/repository/inputs/eval.csv"],
+    "model_paths": [],
+    "checkpoint_paths": []
+  },
+  "intentionally_missing_paths": ["paper_agent/eval_dataset/fixtures/resource_probe/repository/inputs/eval.csv"],
+  "resources": {"cpu": 1, "gpu": 0, "memory_gb": 1},
+  "budget": {"max_runtime_seconds": 60},
+  "known_challenge": "The required CSV path does not exist and must be reported as a blocker."
+}
