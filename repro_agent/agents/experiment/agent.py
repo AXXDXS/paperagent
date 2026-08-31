@@ -303,21 +303,19 @@ class ExperimentExecutionAgent(BaseSubAgent):
             ).hexdigest(),
         }
 
+        # smoke_test/reduced 级别是验证可跑性，pytest 等命令不会产出
+        # metrics 文件；仅 full_experiment 要求 metrics 输出。
         metrics_required = (
-            not result.mock
-            and (
-                tier == ExperimentTier.FULL_EXPERIMENT
-                or (
-                    tier
-                    in (ExperimentTier.SMOKE_TEST, ExperimentTier.REDUCED_EXPERIMENT)
-                    and bool(metrics_output_path)
-                )
-            )
+            not result.mock and tier == ExperimentTier.FULL_EXPERIMENT
         )
         # 包装脚本（例如 ``uv run ... ; echo done``）可能吞掉子进程失败并以
         # 退出码 0 结束。此类“假成功”会污染后续所有阶段，因此在命令自称
         # 成功时扫描 stderr 中的硬错误特征。
-        masked_failure = "" if result.mock else self._masked_failure_reason(result)
+        masked_failure = (
+            self._masked_failure_reason(result)
+            if not result.mock and result.exit_code == 0
+            else ""
+        )
         succeeded = (
             result.exit_code == 0
             and (bool(result.metrics) or not metrics_required)
@@ -437,11 +435,19 @@ class ExperimentExecutionAgent(BaseSubAgent):
                     "stderr_tail": result.stderr_tail[-4000:],
                 },
             )
-        # 被掩盖的失败（退出码 0 但 stderr 有硬错误）意味着包装脚本/命令
-        # 本身有问题：重建环境无法解决，路由到代码修复——coding agent
-        # 会拿到仓库隔离副本与 stderr 诊断来修补脚本。
-        is_code_error = bool(masked_failure) or any(
-            marker in diagnostic_lower for marker in _CODE_ERROR_MARKERS
+        # 被掩盖的普通代码失败意味着包装脚本/命令本身有问题；明确的
+        # ModuleNotFoundError 是例外，不论退出码是否被包装器吞掉，都应
+        # 交给现有环境的依赖修复路径。
+        missing_dependency = bool(
+            re.search(
+                r"(?:ModuleNotFoundError|ImportError):\s*No module named\s*['\"]",
+                diagnostic,
+                re.IGNORECASE,
+            )
+        )
+        is_code_error = not missing_dependency and (
+            bool(masked_failure)
+            or any(marker in diagnostic_lower for marker in _CODE_ERROR_MARKERS)
         )
 
         return FailureReport(

@@ -68,6 +68,9 @@ class EnvironmentBuildResult:
     cache_ref: str = ""
     python_version: str = ""
     package_manifest_digest: str = ""
+    selected_conda_source: str = ""
+    selected_pip_source: str = ""
+    source_attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +94,9 @@ class EnvironmentBuildResult:
             "cache_ref": self.cache_ref,
             "python_version": self.python_version,
             "package_manifest_digest": self.package_manifest_digest,
+            "selected_conda_source": self.selected_conda_source,
+            "selected_pip_source": self.selected_pip_source,
+            "source_attempts": self.source_attempts,
         }
 
 
@@ -118,6 +124,9 @@ class EnvironmentBuildAgent(BaseSubAgent):
     def run(self) -> AgentRunResult:
         repo_root = self.task.definition.inputs.get("repository_path", ".")
         requested_deps = self.task.definition.inputs.get("dependencies_hint", "")
+        repair_dependencies = self._validated_repair_dependencies(
+            self.task.definition.inputs.get("repair_dependencies", [])
+        )
         base_image = self.task.definition.inputs.get("base_image", "python:3.11-slim")
         environment_backend = str(
             self.task.definition.inputs.get("environment_backend", "docker")
@@ -151,7 +160,13 @@ class EnvironmentBuildAgent(BaseSubAgent):
                 python_version=python_version,
             )
 
-            lockfile_content = self._generate_lockfile(dependency_files)
+            lockfile_content = (
+                self._generate_lockfile(
+                    dependency_files, repair_dependencies=repair_dependencies
+                )
+                if repair_dependencies
+                else self._generate_lockfile(dependency_files)
+            )
             self._guarded_write_file(
                 "workspace://requirements.lock.txt", lockfile_content
             )
@@ -162,7 +177,10 @@ class EnvironmentBuildAgent(BaseSubAgent):
                 "workspace://import_smoke_test.py", import_test_code
             )
 
-            online_build = not wheel_dirs
+            # Runtime-discovered packages may not exist in a vendored wheel
+            # directory. Keep local wheels as candidates while allowing an
+            # incremental repair to reach the configured package index.
+            online_build = bool(repair_dependencies) or not wheel_dirs
             force_rebuild = bool(
                 self.task.definition.inputs.get("force_rebuild", False)
             )
@@ -172,6 +190,14 @@ class EnvironmentBuildAgent(BaseSubAgent):
                     python_version=python_version,
                     wheel_dirs=wheel_dirs,
                     force_rebuild=force_rebuild,
+                    repair_existing=bool(
+                        self.task.definition.inputs.get(
+                            "repair_existing_environment", False
+                        )
+                    ),
+                    base_environment_ref=str(
+                        self.task.definition.inputs.get("base_environment_ref", "")
+                    ),
                     network_enabled=online_build,
                 )
                 self._record_conda_build_result(result, build_result)
@@ -285,6 +311,8 @@ class EnvironmentBuildAgent(BaseSubAgent):
         python_version: str,
         wheel_dirs: list[str],
         force_rebuild: bool = False,
+        repair_existing: bool = False,
+        base_environment_ref: str = "",
         network_enabled: bool = False,
     ) -> dict[str, Any]:
         staged_wheel_dirs = [
@@ -301,6 +329,8 @@ class EnvironmentBuildAgent(BaseSubAgent):
             wheel_dirs=staged_wheel_dirs,
             timeout_seconds=1800,
             force_rebuild=force_rebuild,
+            repair_existing=repair_existing,
+            base_environment_ref=base_environment_ref,
             network_enabled=network_enabled,
         )
 
@@ -344,6 +374,11 @@ class EnvironmentBuildAgent(BaseSubAgent):
         result.environment_name = build_result.get(
             "environment_name", result.environment_name
         )
+        result.selected_conda_source = build_result.get(
+            "selected_conda_source", ""
+        )
+        result.selected_pip_source = build_result.get("selected_pip_source", "")
+        result.source_attempts = list(build_result.get("source_attempts", []))
         result.install_log_tail = (
             build_result.get("stdout", "") + "\n" + build_result.get("stderr", "")
         )[-2000:]
@@ -469,7 +504,31 @@ class EnvironmentBuildAgent(BaseSubAgent):
             "# Dependency analysis is stored in the task result metadata.\n"
         )
 
-    def _generate_lockfile(self, dependency_files: dict[str, str]) -> str:
+    @staticmethod
+    def _validated_repair_dependencies(values: Any) -> list[str]:
+        """Accept only plain package names extracted by the controller.
+
+        Experiment stderr is untrusted input.  In particular it must never be
+        able to inject pip options, URLs or local paths into a repair command.
+        """
+
+        if not isinstance(values, list):
+            raise RuntimeError("repair_dependencies must be a list")
+        dependencies: list[str] = []
+        for value in values:
+            package = str(value).strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", package):
+                raise RuntimeError(f"invalid repair dependency: {package!r}")
+            if package.lower() not in {item.lower() for item in dependencies}:
+                dependencies.append(package)
+        return dependencies
+
+    def _generate_lockfile(
+        self,
+        dependency_files: dict[str, str],
+        *,
+        repair_dependencies: list[str] | None = None,
+    ) -> str:
         candidates = [
             (path, content)
             for path, content in dependency_files.items()
@@ -483,18 +542,28 @@ class EnvironmentBuildAgent(BaseSubAgent):
                     "project declares dependencies but has no requirements-style "
                     "offline lock file"
                 )
-            return ""
-        content = selected[0][1]
-        lines = [line.rstrip() for line in content.splitlines() if line.strip()]
-        unpinned = [
-            line for line in lines
-            if not line.lstrip().startswith(("#", "-")) and "==" not in line
-        ]
-        if unpinned:
-            raise RuntimeError(
-                "dependency declaration is not fully pinned: " + ", ".join(unpinned[:5])
-            )
-        lines = self._filter_platform_incompatible(lines)
+            lines: list[str] = []
+        else:
+            content = selected[0][1]
+            lines = [line.rstrip() for line in content.splitlines() if line.strip()]
+            unpinned = [
+                line for line in lines
+                if not line.lstrip().startswith(("#", "-")) and "==" not in line
+            ]
+            if unpinned:
+                raise RuntimeError(
+                    "dependency declaration is not fully pinned: " + ", ".join(unpinned[:5])
+                )
+            lines = self._filter_platform_incompatible(lines)
+        declared_names = {
+            re.split(r"[=<>!~\[\s]", line.lstrip(), maxsplit=1)[0].lower()
+            for line in lines
+            if line.strip() and not line.lstrip().startswith(("#", "-"))
+        }
+        for package in repair_dependencies or []:
+            if package.lower() not in declared_names:
+                lines.append(package)
+                declared_names.add(package.lower())
         return "\n".join(lines) + ("\n" if lines else "")
 
     @staticmethod
@@ -572,7 +641,10 @@ class EnvironmentBuildAgent(BaseSubAgent):
             f"- environment_fingerprint: {result.environment_fingerprint}\n"
             f"- cache_ref: {result.cache_ref}\n"
             f"- cache_hit: {result.cache_hit}\n"
-            f"- cache_rebuilt: {result.cache_rebuilt}\n\n"
+            f"- cache_rebuilt: {result.cache_rebuilt}\n"
+            f"- selected_conda_source: {result.selected_conda_source}\n"
+            f"- selected_pip_source: {result.selected_pip_source}\n"
+            f"- source_attempts: {len(result.source_attempts)}\n\n"
             "## 证据 (L3)\n"
             f"- install_log_tail: {result.install_log_tail[-500:]}\n"
         )

@@ -164,11 +164,9 @@ class InitialPlanner:
                     ),
                 ],
                 expected_outputs=["output/result.json"],
-                # 环境构建是典型的"长时间静默的重型任务"：在线解析依赖
-                # （torch/CUDA 级别的多 GB wheel）时 docker build 单步可
-                # 达 30 分钟。默认 600/1200 秒的软/硬超时会在构建中途
-                # 误判 STALLED 并反复取消重试，这里按构建上限（1800s）
-                # 加上依赖分析、缓存重建重试与安全余量放宽。
+                # 环境构建是典型的重型任务：初始报备预估由 task_factory
+                # 设为 1800s；这里再为依赖分析、下载和缓存重建保留独立
+                # 的软观测窗口与绝对硬上限。
                 soft_timeout_seconds=3600,
                 hard_timeout_seconds=5400,
             ),

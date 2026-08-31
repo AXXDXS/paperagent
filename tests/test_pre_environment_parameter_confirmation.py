@@ -10,9 +10,9 @@ def _initial_resource_and_environment(main_agent: MainAgent) -> tuple[Task, Task
     main_agent.job.inputs.user_run_commands = [
         "python -m compileall -q .",
         "python -m pytest -q",
-        "python train.py --tier smoke",
-        "python train.py --tier reduced",
-        "python train.py --tier full",
+        "python train.py --tier smoke --model",
+        "python train.py --tier reduced --model",
+        "python train.py --tier full --model",
     ]
     main_agent.job_repo.save(main_agent.job)
     resource = Task(
@@ -146,10 +146,19 @@ def test_required_model_configuration_is_combined_with_pre_environment_plan(
         },
     )
     assert resolution.task is not None
-    for command in main_agent.job.inputs.confirmed_execution_plan[
-        "tier_commands"
-    ].values():
-        assert command[-2:] == ["--model", "paper-model-v2"]
+    tier_commands = main_agent.job.inputs.confirmed_execution_plan["tier_commands"]
+    # ``--model`` is a command_argument requirement: it is bound only on
+    # commands that already declare the flag (train.py) and must NOT be
+    # appended to commands that never accepted it (compileall/pytest),
+    # otherwise the run dies with an argument-parser error.
+    for tier, command in tier_commands.items():
+        if "--model" in command:
+            assert command[command.index("--model") + 1] == "paper-model-v2"
+        else:
+            assert "paper-model-v2" not in command
+    assert any(
+        "--model" in command for command in tier_commands.values()
+    ), "at least the train.py tiers must receive the bound --model value"
     assert main_agent.job.inputs.experiment_runtime_config["MODEL_NAME"] == (
         "paper-model-v2"
     )

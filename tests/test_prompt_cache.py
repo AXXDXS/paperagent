@@ -137,3 +137,21 @@ def test_openai_compatible_payload_carries_cache_key(monkeypatch) -> None:
     provider.complete([LLMMessage(role="system", content="stable")], params)
 
     assert captured["prompt_cache_key"] == params.prompt_cache_key
+
+
+def test_runtime_accounting_counts_physical_provider_requests(main_agent) -> None:
+    params = LLMRequestParams(model="test-model")
+    response = LLMResponse(
+        content="ok",
+        usage={
+            "input_tokens": 12,
+            "output_tokens": 3,
+            "request_count": 3,
+        },
+    )
+
+    main_agent.runtime_accounting.record_model_usage(params, response)
+
+    assert main_agent.job.model_calls_made == 3
+    assert main_agent.job.model_input_tokens_used == 12
+    assert main_agent.job.model_output_tokens_used == 3

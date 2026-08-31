@@ -106,6 +106,10 @@ class CondaEnvironmentBuildRequest:
     timeout_seconds: int = 1800
     max_log_bytes: int = 20_000_000
     force_rebuild: bool = False
+    # Runtime dependency repair updates the already validated logical
+    # environment instead of deleting it and creating another prefix.
+    repair_existing: bool = False
+    base_environment_ref: str = ""
     network_enabled: bool = False
     wheel_dirs: tuple[Path, ...] = ()
     cancellation_event: threading.Event | None = None
@@ -125,6 +129,9 @@ class CondaEnvironmentBuildResult:
     cache_ref: str = ""
     package_manifest_digest: str = ""
     environment_name: str = ""
+    selected_conda_source: str = ""
+    selected_pip_source: str = ""
+    source_attempts: list[dict[str, object]] = field(default_factory=list)
 
 
 class ExecutionBackend(Protocol):

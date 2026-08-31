@@ -10,7 +10,7 @@
 主循环严格对齐设计文档 §19 的伪代码结构，逐行对应：
 
     scheduler.refresh_task_states()      -> self.scheduler.refresh_task_states()
-    scheduler.check_heartbeats()         -> self.scheduler.check_heartbeats()
+    scheduler/reporting deadline check   -> self._check_subagent_reporting()
     scheduler.check_timeouts()           -> self.scheduler.check_timeouts()
     main_agent.validate_outputs(...)     -> self.validate_outputs(...)
     main_agent.classify_failure(task)    -> self.replanner.classify_failure(task)
@@ -56,7 +56,13 @@ from repro_agent.domain.enums import (
 from repro_agent.domain.experiment import MetricComparison
 from repro_agent.domain.job import ReproductionJob
 from repro_agent.domain.reflection import AuditFinding, ReflectionHypothesis, ReflectionReport
-from repro_agent.domain.task import FailureReport, Task
+from repro_agent.domain.task import (
+    AgentReport,
+    AgentReportType,
+    FailureReport,
+    Heartbeat,
+    Task,
+)
 from repro_agent.domain.verification import VerificationRecord
 from repro_agent.dynamic_tools.lifecycle import DynamicToolLifecycleManager
 from repro_agent.execution import (
@@ -65,6 +71,7 @@ from repro_agent.execution import (
     DockerExecutionBackend,
     MockExecutionBackend,
 )
+from repro_agent.execution.environment_naming import managed_environment_name
 from repro_agent.memory.candidate import CandidateMemory
 from repro_agent.memory.manager import MainAgentCapability, MemoryManager
 from repro_agent.orchestrator.dispatcher import AgentDispatcher
@@ -104,9 +111,8 @@ from repro_agent.orchestrator.artifacts import ArtifactResolver
 from repro_agent.orchestrator.agent_tools import CreateSubagentsTool
 from repro_agent.sandbox.manager import SandboxManager
 from repro_agent.scheduler.scheduler import SchedulerConfig, TaskScheduler
-from repro_agent.scheduler.subagent_liveness import (
-    LivenessOutcome,
-    LivenessPolicy,
+from repro_agent.scheduler.agent_reporting import (
+    ReportingOutcome,
     TerminationMode,
     TerminationRecord,
 )
@@ -152,8 +158,14 @@ class MainAgentConfig:
     # container_runtime behavior; "conda" enables trusted-local Conda mode.
     environment_backend: str = ""
     conda_executable: str = "conda"
-    conda_env_root: str = "./conda_envs"
+    # ~/.conda/envs is a standard Conda environment directory, so environments
+    # appear by name in `conda env list` instead of as anonymous custom paths.
+    conda_env_root: str = "~/.conda/envs"
     conda_python_version: str = "3.11"
+    # Empty delegates to REPRO_AGENT_MIRROR_POLICY (defaulting to auto).
+    mirror_policy: str = ""
+    pip_index_urls: tuple[str, ...] = ()
+    conda_channels: tuple[str, ...] = ()
     execution_image: str = "python:3.11-slim"
     main_loop_wait_seconds: float = 0.05
     timeout_cancel_grace_seconds: float = 5.0
@@ -194,6 +206,9 @@ class MainAgent:
             return CondaExecutionBackend(
                 environment_root=config.conda_env_root,
                 conda_binary=config.conda_executable,
+                mirror_policy=config.mirror_policy,
+                pip_index_urls=config.pip_index_urls,
+                conda_channels=config.conda_channels,
             )
         if runtime == "colima":
             return ColimaExecutionBackend()
@@ -278,9 +293,8 @@ class MainAgent:
             model=config.model,
             max_tokens=config.model_max_tokens,
             llm_timeout_seconds=config.llm_timeout_seconds,
-            # push 心跳通道直接落到调度器的心跳表：子智能体主动汇报的
-            # 每一条进度都经由 scheduler.report_heartbeat 落库，
-            # reported_by="push" 由 Heartbeat 构造时的默认值保证。
+            # 子智能体窄通道在 MainAgent 中拆分为业务 AgentReport 与
+            # 底层 ActivitySignal，再分别持久化。
             on_progress_push=self._on_subagent_progress_push,
             # 运行期缺工具升级通道：裁决器 + 人工介入创建回调。
             tool_grant_decision_maker=self.tool_grant_decision_maker,
@@ -314,9 +328,9 @@ class MainAgent:
             conda_python_version=config.conda_python_version,
         )
         self.phase_coordinator = PhaseCoordinator()
-        # 子智能体存活性策略：判断"多久没 push 就该 pull""pull 后如何
-        # 裁决死亡"，见 scheduler/subagent_liveness.py 顶部说明。
-        self.liveness_policy = LivenessPolicy()
+        # 调度器和主 Agent 共享同一个动态报备策略；底层活动信号不参与
+        # 截止时间续期，避免与业务报备形成两套冲突的判定。
+        self.reporting_policy = self.scheduler.reporting_policy
         self._termination_log: list[TerminationRecord] = []
 
         # 记忆系统：MainAgentCapability 只在这里被构造一次，永远不会
@@ -349,10 +363,13 @@ class MainAgent:
         # 是"验证通过后才能关闭子agent"约束的核心状态。
         self._pending_validation: set[str] = set()
         self._pending_validation_attempts: dict[str, str] = {}
-        # 子智能体 push 心跳或完成回调会唤醒主循环；超时等待仍作为
+        # 子智能体报备、活动或完成回调会唤醒主循环；超时等待仍作为
         # 容错兜底，从而避免无任务变化时持续空转和刷写快照。
         self._wake_event = threading.Event()
         self._timeout_cancellations: dict[str, float] = {}
+        # 与上面的既有取消计时表配套，仅保存终止语义，不再建立第二套
+        # 取消状态机。缺项表示普通硬/软超时取消，兼容旧快照和测试注入。
+        self._termination_requests: dict[str, dict[str, Any]] = {}
 
         self.job_repo.save(self.job)
 
@@ -604,16 +621,10 @@ class MainAgent:
                 return
 
         self.scheduler.refresh_task_states()
-        self.scheduler.check_heartbeats()
-        self._check_subagent_liveness()
+        self._check_subagent_reporting()
         timeout_result = self.scheduler.check_timeouts()
         for task in timeout_result.hard_timeout_tasks:
             self.task_repo.record_event(self.job.job_id, task.task_id, "hard_timeout_observed", {})
-            self._begin_timeout_termination(task)
-        for task in timeout_result.stalled_tasks:
-            self.task_repo.record_event(
-                self.job.job_id, task.task_id, "soft_timeout_observed", {}
-            )
             self._begin_timeout_termination(task)
         self._settle_timeout_terminations()
 
@@ -1321,34 +1332,50 @@ class MainAgent:
                 self._pending_validation.discard(task_id)
         return tasks
 
-    # ---- 子智能体存活性：push 汇报 / pull 探测 / 死亡判定 / 强制终止 ----
-    #
-    # 对应用户需求"子agent若达到主agent要求的时间没有完成，必须向
-    # 主agent汇报状态...如果超时2分钟没有汇报，主agent要强制查看子
-    # agent状态，确保子agent活着...如果主agent判定子agent死亡，则
-    # 强制终止(forced)为兜底"。四个步骤严格按顺序落地在
-    # ``_check_subagent_liveness`` 里，每一步都对应一个独立、可单测
-    # 的组件（``LivenessPolicy``/``SubAgentHandle``），本方法只是把
-    # 它们按正确顺序串起来。
+    # ---- 子智能体动态报备：业务租约 + 活动信号 + 到期主动查询 ----
 
-    def _on_subagent_progress_push(self, task: Task, progress: float, current_step: str, eta_seconds) -> None:
-        """子智能体 push 心跳的落地点：直接委托给调度器心跳表。
+    def _on_subagent_progress_push(
+        self,
+        task: Task,
+        progress: float,
+        current_step: str,
+        eta_seconds,
+    ) -> None:
+        """接收子 Agent 的窄通道消息并按语义分流。
 
-        ``reported_by="push"`` 由 ``Heartbeat`` 的默认值保证——本方法
-        自己不构造 ``Heartbeat``，而是让 ``TaskScheduler.report_heartbeat``
-        统一处理，避免出现两条不同的心跳写入路径。
+        所有消息都会形成活动快照；只有业务报告才更新下一报备截止
+        时间。``activity:`` 前缀专用于工具/等待状态，绝不续期。
         """
 
-        from repro_agent.domain.task import Heartbeat as _Heartbeat  # 局部导入避免循环引用
-
-        heartbeat = _Heartbeat(
+        activity = Heartbeat(
             progress=progress,
             current_step=current_step,
-            last_completed_step=task.heartbeat.last_completed_step if task.heartbeat else "",
+            last_completed_step=(
+                task.heartbeat.last_completed_step if task.heartbeat else ""
+            ),
             eta_seconds=eta_seconds,
             reported_by="push",
         )
-        self.scheduler.report_heartbeat(task.task_id, heartbeat)
+        self.scheduler.report_heartbeat(task.task_id, activity)
+        if current_step.startswith("activity:"):
+            self._wake_event.set()
+            return
+
+        report_type = {
+            "started": AgentReportType.STARTED,
+            "completed": AgentReportType.COMPLETED,
+            "failed": AgentReportType.FAILED,
+        }.get(current_step, AgentReportType.PROGRESS)
+        report = AgentReport(
+            attempt_id=task.active_attempt_id,
+            report_type=report_type,
+            progress=min(1.0, max(0.0, float(progress))),
+            current_step=current_step,
+            eta_seconds=eta_seconds,
+            next_report_after_seconds=eta_seconds,
+            reported_by="push",
+        )
+        self.scheduler.report_agent(task.task_id, report)
         self._wake_event.set()
 
     def get_subagent_status(self, task_id: str):
@@ -1358,9 +1385,9 @@ class MainAgent:
         get_subagent_status(agent_id)，返回子 Agent 的当前状态...
         进度及最近活动时间"对应的公开接口，任何时候都可以调用（不需要
         等到"超时未汇报"才能用），但只有在超时未汇报的场景下，主循环
-        才会把它的结果当作死亡判定的关键证据（见
-        ``_check_subagent_liveness``），避免把"随手查一下"和"关键存活
-        判定"这两种不同严重程度的调用混为一谈。
+        才会把它的结果用于延期/终止裁决（见
+        ``_check_subagent_reporting``），避免把"随手查一下"和"报备
+        到期后的关键查询"混为一谈。
         """
 
         handle = self.dispatcher.get_handle(task_id)
@@ -1369,109 +1396,129 @@ class MainAgent:
         heartbeat = handle.pull_status()
         task = self.scheduler.dag.get(task_id)
         if task is not None:
-            task.last_pull_heartbeat = heartbeat
-            self.task_repo.save(task)
+            self.scheduler.report_heartbeat(task_id, heartbeat)
         return heartbeat
 
-    def _check_subagent_liveness(self) -> None:
+    def _check_subagent_reporting(self) -> None:
+        """Enforce dynamic report deadlines without fixed heartbeat polling.
+
+        At the promised time, a finished handle is left to the normal result
+        collector.  Otherwise the main Agent actively pulls status.  A live
+        response creates exactly one EXTENSION report; the third extension
+        exhausts the reporting budget and starts terminal cancellation.
+        """
+
         for task in list(self.scheduler.dag.all_tasks()):
             if task.status != TaskStatus.RUNNING:
+                continue
+            if task.task_id in self._timeout_cancellations:
                 continue
             handle = self.dispatcher.get_handle(task.task_id)
             if handle is None:
                 continue
+            if handle.is_finished():
+                continue
 
-            decision = self.liveness_policy.evaluate_push_freshness(task)
-            if decision.outcome != LivenessOutcome.OVERDUE_NEEDS_PULL:
+            decision = self.reporting_policy.evaluate(task)
+            if decision.outcome != ReportingOutcome.DUE:
                 continue
 
             logger.warning(
-                "task %s overdue for push heartbeat (%s); forcing status pull",
+                "task %s reached report deadline (%s); pulling status",
                 task.task_id,
                 decision.detail,
             )
             self.task_repo.record_event(
                 self.job.job_id,
                 task.task_id,
-                "subagent_overdue_forcing_pull",
-                {"detail": decision.detail, "seconds_since_last_push": decision.seconds_since_last_push},
+                "agent_report_deadline_reached",
+                {
+                    "detail": decision.detail,
+                    "due_at": decision.due_at.isoformat()
+                    if decision.due_at
+                    else None,
+                    "seconds_overdue": decision.seconds_overdue,
+                    "overrun_report_count": task.overrun_report_count,
+                },
             )
 
-            pull_succeeded = handle.is_alive()
-            self.get_subagent_status(task.task_id)  # 落一条 pull 心跳，供审计/UI 展示
-            pull_decision = self.liveness_policy.judge_after_pull(task, pull_succeeded=pull_succeeded)
+            heartbeat = self.get_subagent_status(task.task_id)
+            if heartbeat is None or not handle.is_alive():
+                task.failure_report = FailureReport(
+                    failure_type=FailureType.AGENT_STALLED,
+                    failed_step="report_deadline_status_pull",
+                    error_message="status pull could not confirm the sub-agent is alive",
+                    recommended_action="确认执行后端已停止后再重试",
+                )
+                self.task_repo.save(task)
+                self._terminate_subagent(
+                    task,
+                    handle,
+                    reason="status pull could not confirm the sub-agent is alive",
+                    terminal=False,
+                )
+                continue
 
-            self.task_repo.record_event(
-                self.job.job_id,
-                task.task_id,
-                "subagent_liveness_pull_result",
-                {"outcome": pull_decision.outcome.value, "detail": pull_decision.detail},
+            extension = AgentReport(
+                attempt_id=task.active_attempt_id,
+                report_type=AgentReportType.EXTENSION,
+                progress=heartbeat.progress,
+                current_step=heartbeat.current_step,
+                eta_seconds=heartbeat.eta_seconds,
+                next_report_after_seconds=heartbeat.eta_seconds,
+                reason="promised completion time reached; main agent pulled live status",
+                evidence={"thread_alive": True},
+                reported_by="pull",
+            )
+            self.scheduler.report_agent(task.task_id, extension)
+            limit = max(1, int(task.definition.max_overrun_reports))
+            if task.overrun_report_count < limit:
+                continue
+
+            task.reporting_exhausted = True
+            task.failure_report = FailureReport(
+                failure_type=FailureType.AGENT_STALLED,
+                failed_step="reporting_budget_exhausted",
+                last_successful_step=heartbeat.last_completed_step,
+                error_message=(
+                    f"sub-agent remained unfinished after {limit} overdue reports"
+                ),
+                likely_causes=["执行持续超过多次由子 Agent 给出的完成预估"],
+                recommended_action="保留证据并如实上报；需要时由用户显式创建新任务",
+                metadata={
+                    "overrun_report_count": task.overrun_report_count,
+                    "max_overrun_reports": limit,
+                },
+            )
+            self.task_repo.save_with_event(
+                task,
+                "agent_reporting_budget_exhausted",
+                task.failure_report.to_dict(),
+                event_key=(
+                    f"report-budget-exhausted:{task.task_id}:"
+                    f"{task.active_attempt_id}"
+                ),
+            )
+            self._terminate_subagent(
+                task,
+                handle,
+                reason=task.failure_report.error_message,
+                terminal=True,
             )
 
-            if pull_decision.outcome == LivenessOutcome.CONFIRMED_DEAD:
-                self._terminate_subagent(task, handle, reason=pull_decision.detail)
+    def _terminate_subagent(
+        self,
+        task: Task,
+        handle,
+        *,
+        reason: str,
+        terminal: bool = False,
+    ) -> None:
+        """Start non-blocking cancellation through the shared termination path."""
 
-    def _terminate_subagent(self, task: Task, handle, *, reason: str) -> None:
-        """死亡判定后的终止流程：先优雅信号，宽限期无响应再强制终止。
-
-        宽限期本身复用任务的 ``heartbeat_interval_seconds``（子智能体
-        正常汇报节奏的量级）作为"给它一次体面退出机会"的等待时间，
-        不引入额外的魔法数字；真实生产环境中这里应该是"设置取消信号
-        后立即返回，在下一次 ``step()`` 迭代里再检查是否已经退出"，
-        避免阻塞主循环——本实现为了逻辑清晰选择了一次有上限的忙等，
-        上限就是 ``heartbeat_interval_seconds``，不会无限期阻塞主循环。
-        """
-
-        import time
-
-        record = TerminationRecord(task_id=task.task_id, mode=TerminationMode.GRACEFUL, reason=reason)
-        handle.request_graceful_cancel()
-        self.scheduler.lease_manager.request_cancel(task.task_id)
-        self.task_repo.record_event(
-            self.job.job_id, task.task_id, "subagent_graceful_cancel_requested", {"reason": reason}
+        self._begin_subagent_termination(
+            task, reason=reason, terminal=terminal, handle=handle
         )
-
-        grace = max(1, task.definition.heartbeat_interval_seconds)
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline and handle.is_alive():
-            time.sleep(0.2)
-
-        if not handle.is_alive():
-            record.mode = TerminationMode.GRACEFUL
-            record.completed_at = self._now()
-            logger.info("task %s terminated gracefully after cancellation signal", task.task_id)
-        else:
-            # 优雅信号在宽限期内无响应，执行强制终止兜底。
-            handle.force_kill()
-            record.mode = TerminationMode.FORCED
-            record.completed_at = self._now()
-            logger.error(
-                "task %s did not respond to graceful cancellation within %ss; forced termination "
-                "(may leave dangling resources / incomplete writes)",
-                task.task_id,
-                grace,
-            )
-
-        self._termination_log.append(record)
-        self.task_repo.record_event(
-            self.job.job_id, task.task_id, "subagent_terminated", record.to_dict()
-        )
-
-        failure_report = None
-        try:
-            result = handle.collect_result()
-            failure_report = result.failure_report
-        except Exception:  # noqa: BLE001 - 强杀场景下取不到结果是预期情况
-            pass
-
-        self.scheduler.mark_failed(task, TaskStatus.HARD_TIMEOUT, failure_report)
-        # 死亡判定是一条明确的终态失败路径（不是"子智能体自称成功等待
-        # 校验"），不需要再等待 validate_outputs 介入，可以在这里安全
-        # 回收句柄；若任务此前恰好已经处于待校验集合中（理论上不会
-        # 发生——is_alive() 为 False 时线程必然已经产出了结果，会先被
-        # _collect_finished_subagents 分流），一并清理以保持状态一致。
-        self._pending_validation.discard(task.task_id)
-        self.dispatcher.discard_handle(task.task_id)
 
     @staticmethod
     def _now():
@@ -1482,6 +1529,11 @@ class MainAgent:
     # ---- 失败分类与处理（§19）----
 
     def _handle_failed_task(self, task: Task) -> bool:
+        if task.status == TaskStatus.TERMINAL_FAILURE:
+            # Terminal means no automatic retry/replan.  In particular, a task
+            # that exhausted three report extensions must not re-enter the same
+            # loop merely because AGENT_STALLED is normally retryable.
+            return False
         if task.task_id in self._timeout_cancellations:
             # 重试必须等当前执行句柄明确退出；否则旧/新 attempt 会并行运行。
             return False
@@ -1619,6 +1671,14 @@ class MainAgent:
         repair = self.replanner.create_environment_repair(
             task,
             repository_path=self._repository_used_by_failed_execution(task),
+        )
+        # The logical environment identity belongs to the job, not to an
+        # attempt-specific staged repository path.  Legacy experiment tasks may
+        # not carry it, so bind the stable job-level name before scheduling.
+        repair.definition.inputs["environment_name"] = managed_environment_name(
+            task.definition.inputs.get("environment_name")
+            or self.job.inputs.environment_name,
+            self.job.inputs.repository_path,
         )
         canonical = self.scheduler.block_until(
             task,
@@ -1883,41 +1943,100 @@ class MainAgent:
         return redacted[:600]
 
     def _begin_timeout_termination(self, task: Task) -> None:
-        handle = self.dispatcher.get_handle(task.task_id)
+        reason = (
+            task.failure_report.error_message
+            if task.failure_report is not None
+            else f"task entered timeout state {task.status.value}"
+        )
+        self._begin_subagent_termination(task, reason=reason, terminal=False)
+
+    def _begin_subagent_termination(
+        self,
+        task: Task,
+        *,
+        reason: str,
+        terminal: bool,
+        handle=None,
+    ) -> None:
+        """Use one asynchronous graceful/forced cancellation state machine."""
+
+        handle = handle or self.dispatcher.get_handle(task.task_id)
         if handle is None:
             self.scheduler.lease_manager.release(task)
-            self.task_repo.save(task)
+            if terminal:
+                self.scheduler.mark_terminal_failure(task, reason=reason)
+            else:
+                self.task_repo.save(task)
             return
         if task.task_id in self._timeout_cancellations:
+            if terminal:
+                request = self._termination_requests.setdefault(task.task_id, {})
+                request.update({"terminal": True, "reason": reason})
             return
         handle.request_graceful_cancel()
         self.scheduler.lease_manager.request_cancel(task.task_id)
         self._timeout_cancellations[task.task_id] = time.monotonic()
+        self._termination_requests[task.task_id] = {
+            "terminal": terminal,
+            "reason": reason,
+            "record": TerminationRecord(
+                task_id=task.task_id,
+                mode=TerminationMode.GRACEFUL,
+                reason=reason,
+            ),
+        }
         self.task_repo.record_event(
             self.job.job_id,
             task.task_id,
-            "timeout_cancellation_requested",
-            {"attempt_id": handle.attempt_id, "timeout_status": task.status.value},
+            "subagent_cancellation_requested",
+            {
+                "attempt_id": handle.attempt_id,
+                "status": task.status.value,
+                "terminal": terminal,
+                "reason": reason,
+            },
         )
 
     def _settle_timeout_terminations(self) -> None:
         for task_id, requested_at in list(self._timeout_cancellations.items()):
             task = self.scheduler.dag.get(task_id)
             handle = self.dispatcher.get_handle(task_id)
+            request = self._termination_requests.get(task_id, {})
             if task is None or handle is None:
                 self._timeout_cancellations.pop(task_id, None)
+                self._termination_requests.pop(task_id, None)
                 continue
             if handle.is_finished():
                 # Only after confirmed thread/backend termination may this attempt
                 # release its lease and become eligible for retry.
-                self.scheduler.mark_failed(task, TaskStatus.FAILED_RETRYABLE, task.failure_report)
+                if request.get("terminal", False):
+                    self.scheduler.mark_terminal_failure(
+                        task, reason=str(request.get("reason", "reporting exhausted"))
+                    )
+                else:
+                    self.scheduler.mark_failed(
+                        task, TaskStatus.FAILED_RETRYABLE, task.failure_report
+                    )
+                record = request.get("record")
+                if isinstance(record, TerminationRecord):
+                    record.mode = TerminationMode.GRACEFUL
+                    record.completed_at = self._now()
+                    self._termination_log.append(record)
                 self.dispatcher.discard_handle(task_id, attempt_id=handle.attempt_id)
                 self._timeout_cancellations.pop(task_id, None)
+                self._termination_requests.pop(task_id, None)
+                self._pending_validation.discard(task_id)
                 self.task_repo.record_event(
                     self.job.job_id,
                     task_id,
-                    "timeout_termination_confirmed",
-                    {"attempt_id": handle.attempt_id},
+                    "subagent_termination_confirmed",
+                    {
+                        "attempt_id": handle.attempt_id,
+                        "terminal": bool(request.get("terminal", False)),
+                        "termination": record.to_dict()
+                        if isinstance(record, TerminationRecord)
+                        else None,
+                    },
                 )
                 continue
             if time.monotonic() - requested_at < self.config.timeout_cancel_grace_seconds:
@@ -1927,16 +2046,35 @@ class MainAgent:
             # terminally instead of releasing it into a concurrent retry.
             handle.force_kill()
             self.scheduler.lease_manager.release(task)
-            self.scheduler.mark_terminal_failure(
-                task, reason="execution termination could not be confirmed after hard timeout"
+            reason = str(
+                request.get(
+                    "reason",
+                    "execution termination could not be confirmed after timeout",
+                )
             )
+            self.scheduler.mark_terminal_failure(
+                task, reason=reason
+            )
+            record = request.get("record")
+            if isinstance(record, TerminationRecord):
+                record.mode = TerminationMode.FORCED
+                record.completed_at = self._now()
+                self._termination_log.append(record)
             self.dispatcher.discard_handle(task_id, attempt_id=handle.attempt_id)
             self._timeout_cancellations.pop(task_id, None)
+            self._termination_requests.pop(task_id, None)
+            self._pending_validation.discard(task_id)
             self.task_repo.record_event(
                 self.job.job_id,
                 task_id,
-                "timeout_termination_unconfirmed",
-                {"attempt_id": handle.attempt_id},
+                "subagent_termination_forced",
+                {
+                    "attempt_id": handle.attempt_id,
+                    "reason": reason,
+                    "termination": record.to_dict()
+                    if isinstance(record, TerminationRecord)
+                    else None,
+                },
             )
 
     def _classify_failure_via_llm(self, task: Task) -> FailureDecision:

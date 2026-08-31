@@ -148,6 +148,25 @@ class PhaseCoordinator:
             environment_payload = self._payload(environment) or {}
             resource_payload = self._payload(resource_task) if resource_task else {}
             confirmed_plan = job.inputs.confirmed_execution_plan or {}
+            execution_timeout_seconds = int(
+                confirmed_plan.get(
+                    "timeout_seconds", job.inputs.max_runtime_seconds or 600
+                )
+            )
+            tier_report_caps = {
+                ExperimentTier.STATIC_CHECK: 300,
+                ExperimentTier.UNIT_TEST: 600,
+                ExperimentTier.SMOKE_TEST: 900,
+                ExperimentTier.REDUCED_EXPERIMENT: 3600,
+            }
+            expected_duration_seconds = (
+                execution_timeout_seconds
+                if tier == ExperimentTier.FULL_EXPERIMENT
+                else min(
+                    execution_timeout_seconds,
+                    tier_report_caps.get(tier, execution_timeout_seconds),
+                )
+            )
             dependencies = [
                 item.task_id
                 for item in (previous, environment, spec_task, resource_task)
@@ -175,9 +194,7 @@ class PhaseCoordinator:
                         "dataset_paths": job.inputs.dataset_paths,
                         "model_paths": job.inputs.model_paths,
                         "checkpoint_paths": job.inputs.checkpoint_paths,
-                        "timeout_seconds": confirmed_plan.get(
-                            "timeout_seconds", job.inputs.max_runtime_seconds or 600
-                        ),
+                        "timeout_seconds": execution_timeout_seconds,
                         "metrics_output_path": confirmed_plan.get(
                             "metrics_output_path", "output://metrics.json"
                         ),
@@ -188,6 +205,9 @@ class PhaseCoordinator:
                         ),
                         "environment_backend": environment_payload.get(
                             "environment_backend", "docker"
+                        ),
+                        "environment_name": environment_payload.get(
+                            "environment_name", ""
                         ),
                         "python_version": environment_payload.get(
                             "python_version", "3.11"
@@ -236,21 +256,11 @@ class PhaseCoordinator:
                     },
                     restrict_tools=["execute_command", "read_file", "hash_path"],
                     expected_outputs=["output/result.json", "output/candidate_memory.md"],
-                    # watchdog 超时必须与执行超时同尺度：默认 hard=1200s 会把
-                    # 任何长实验（自建 venv、下载 torch、全量评测）在 20 分钟
-                    # 处直接判 AGENT_STALLED 杀掉，即使子智能体一直健康。
-                    soft_timeout_seconds=(
-                        confirmed_plan.get(
-                            "timeout_seconds", job.inputs.max_runtime_seconds or 600
-                        )
-                        + 600
-                    ),
-                    hard_timeout_seconds=(
-                        confirmed_plan.get(
-                            "timeout_seconds", job.inputs.max_runtime_seconds or 600
-                        )
-                        + 1800
-                    ),
+                    expected_duration_seconds=max(1, expected_duration_seconds),
+                    # 报备预计时间按门禁层级设置；绝对硬上限仍与用户确认
+                    # 的执行超时同尺度，并保留收尾/取消安全余量。
+                    soft_timeout_seconds=execution_timeout_seconds + 600,
+                    hard_timeout_seconds=execution_timeout_seconds + 1800,
                 ),
             )
             return PhaseDecision(job_status=_TIER_JOB_STATUS[tier], tasks_to_create=[task])

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,12 @@ from repro_agent.tools.destructive_actions import (
     inspect_destructive_command,
 )
 
-_MAX_COMMAND_TIMEOUT_S = 1800
+# 单条命令超时硬上限。全量实验（如 LoCoMo 完整评测）可持续十几小时，
+# 通过 REPRO_AGENT_MAX_COMMAND_TIMEOUT_S 环境变量显式放宽；默认保持
+# 1800s 以维持普通命令的 fail-fast 行为。
+_MAX_COMMAND_TIMEOUT_S = max(
+    1, int(os.environ.get("REPRO_AGENT_MAX_COMMAND_TIMEOUT_S", "1800") or 1800)
+)
 
 
 def write_file(ctx: SandboxContext, path: str, content: str) -> dict[str, Any]:
@@ -303,13 +309,15 @@ def build_conda_environment(
     wheel_dirs: list[str] | None = None,
     timeout_seconds: int = 1800,
     force_rebuild: bool = False,
+    repair_existing: bool = False,
+    base_environment_ref: str = "",
     network_enabled: bool = False,
 ) -> dict[str, Any]:
     """Create or reuse a controller-managed Conda prefix.
 
     The prefix itself is never exposed as an arbitrary host path.  Consumers
-    receive an opaque ``conda://<sha256>`` reference which the configured Conda
-    execution backend resolves inside its managed environment root.
+    receive an opaque, name-bound ``conda://<sha256>/<name>`` reference which
+    the configured Conda execution backend resolves inside its managed root.
     """
 
     backend = getattr(ctx, "execution_backend", None)
@@ -335,6 +343,8 @@ def build_conda_environment(
                 timeout_seconds=min(timeout_seconds, _MAX_COMMAND_TIMEOUT_S),
                 max_log_bytes=ctx.policy.resource_limits.max_log_bytes,
                 force_rebuild=force_rebuild,
+                repair_existing=repair_existing,
+                base_environment_ref=base_environment_ref,
                 network_enabled=network_enabled,
                 wheel_dirs=tuple(resolved_wheels),
                 cancellation_event=getattr(ctx, "cancellation_event", None),
@@ -357,6 +367,9 @@ def build_conda_environment(
         "cache_ref": result.cache_ref,
         "package_manifest_digest": result.package_manifest_digest,
         "environment_name": result.environment_name,
+        "selected_conda_source": result.selected_conda_source,
+        "selected_pip_source": result.selected_pip_source,
+        "source_attempts": result.source_attempts,
     }
 
 
@@ -479,6 +492,9 @@ _CONDA_BUILD_OUTPUT_SCHEMA = _strict_object(
         "cache_ref",
         "package_manifest_digest",
         "environment_name",
+        "selected_conda_source",
+        "selected_pip_source",
+        "source_attempts",
     ],
     {
         "environment_ref": {"type": "string"},
@@ -493,6 +509,29 @@ _CONDA_BUILD_OUTPUT_SCHEMA = _strict_object(
         "cache_ref": {"type": "string"},
         "package_manifest_digest": {"type": "string"},
         "environment_name": {"type": "string"},
+        "selected_conda_source": {"type": "string"},
+        "selected_pip_source": {"type": "string"},
+        "source_attempts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "phase",
+                    "source",
+                    "location",
+                    "exit_code",
+                    "failure_kind",
+                ],
+                "properties": {
+                    "phase": {"type": "string"},
+                    "source": {"type": "string"},
+                    "location": {"type": "string"},
+                    "exit_code": {"type": "integer"},
+                    "failure_kind": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
     },
 )
 _DISABLED_TOOL_OUTPUT_SCHEMA = _strict_object([], {})
@@ -515,7 +554,8 @@ TOOL_SPECS = [
         returns=(
             "{environment_ref, environment_digest, exit_code, stdout, stderr, "
             "termination_reason, cache_hit, environment_fingerprint, cache_ref, "
-            "package_manifest_digest, environment_name}"
+            "package_manifest_digest, environment_name, selected_conda_source, "
+            "selected_pip_source, source_attempts}"
         ),
     ),
     ToolSpec(

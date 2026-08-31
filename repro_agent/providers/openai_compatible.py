@@ -15,6 +15,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -47,10 +48,54 @@ class OpenAICompatibleProvider:
         self, messages: list[LLMMessage], params: LLMRequestParams
     ) -> LLMResponse:
         payload = self._build_payload(messages, params)
+        deadline = time.monotonic() + max(0.0, params.timeout_seconds)
+        request_trace: dict = {"request_count": 0, "usages": []}
+        body = self._post_with_format_fallback(
+            payload,
+            params,
+            deadline=deadline,
+            request_trace=request_trace,
+        )
+        # 推理型模型护栏：若模型把全部输出预算耗在思考 token 上（content
+        # 为空、finish_reason=length、reasoning_tokens == completion_tokens），
+        # 在同一个总超时预算内重发一次并请求关闭思考。兼容网关如果不支持
+        # 该参数会返回协议错误，此时保留原响应交给上层结构化重试处理。
+        if self._is_reasoning_budget_exhausted(body):
+            logger.warning(
+                "LLM burned the entire completion budget on reasoning tokens "
+                "(empty content, finish_reason=length); retrying with "
+                "reasoning_effort=none"
+            )
+            no_think_payload = dict(payload)
+            no_think_payload["reasoning_effort"] = "none"
+            try:
+                no_think_body = self._post_with_format_fallback(
+                    no_think_payload,
+                    params,
+                    deadline=deadline,
+                    request_trace=request_trace,
+                )
+                if self._has_usable_output(no_think_body):
+                    body = no_think_body
+            except LLMProviderError as exc:
+                logger.warning(
+                    "reasoning-disabled retry failed (%s); keeping original response", exc
+                )
+        body = self._attach_aggregate_usage(body, request_trace)
+        return self._parse_response(body)
+
+    def _post_with_format_fallback(
+        self,
+        payload: dict,
+        params: LLMRequestParams,
+        *,
+        deadline: float,
+        request_trace: dict,
+    ) -> dict:
         try:
-            body = self._post_chat_completion(payload, params.timeout_seconds)
+            return self._post_once(payload, deadline, request_trace)
         except LLMProviderError as exc:
-            # 部分 OpenAI 兼容网关（例如 AIGC 网关的 deepseek-v4-pro）不支持
+            # 部分 OpenAI 兼容网关不支持
             # ``response_format=json_schema`` 提示并返回 HTTP 400。本地 JSON
             # Schema 校验（``llm_output.parse_structured_json``）才是权威，
             # 该提示只是尽力引导——因此去掉提示后原样重发一次，不放宽任何
@@ -62,14 +107,118 @@ class OpenAICompatibleProvider:
                 "retrying once without it",
                 exc,
             )
-            payload = {key: value for key, value in payload.items() if key != "response_format"}
+            stripped = {key: value for key, value in payload.items() if key != "response_format"}
             # fallback 请求也可能遇到瞬时网络异常（RemoteDisconnected
             # 等），_post_chat_completion 已将其归一化为可重试的
             # LLMProviderError；这里直接 re-raise 交给上层
             # retry.call_with_retry 的指数退避重试处理，避免在
             # complete() 内部死循环重试同一个 fallback。
-            body = self._post_chat_completion(payload, params.timeout_seconds)
-        return self._parse_response(body)
+            return self._post_once(stripped, deadline, request_trace)
+
+    def _post_once(self, payload: dict, deadline: float, request_trace: dict) -> dict:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LLMProviderError(
+                "timeout calling LLM API before fallback request",
+                is_retryable=True,
+            )
+        request_trace["request_count"] += 1
+        body = self._post_chat_completion(payload, remaining)
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if isinstance(usage, dict):
+            request_trace["usages"].append(usage)
+        return body
+
+    @staticmethod
+    def _has_usable_output(body: dict) -> bool:
+        message = (body.get("choices") or [{}])[0].get("message") or {}
+        return bool(message.get("content") or message.get("tool_calls"))
+
+    @classmethod
+    def _attach_aggregate_usage(cls, body: dict, request_trace: dict) -> dict:
+        """Expose physical-request usage to the outer metering decorator."""
+
+        usages = request_trace.get("usages") or []
+        aggregate = dict(body.get("usage") or {})
+        aggregate["input_tokens"] = sum(
+            cls._usage_int(usage, "input_tokens", "prompt_tokens")
+            for usage in usages
+        )
+        aggregate["output_tokens"] = sum(
+            cls._usage_int(usage, "output_tokens", "completion_tokens")
+            for usage in usages
+        )
+        aggregate["request_count"] = max(
+            1, int(request_trace.get("request_count") or 1)
+        )
+        aggregate["successful_request_count"] = len(usages)
+
+        cached_tokens = 0
+        cache_write_tokens = 0
+        for usage in usages:
+            details = (
+                usage.get("input_tokens_details")
+                or usage.get("prompt_tokens_details")
+                or {}
+            )
+            cached_tokens += cls._usage_int(
+                details, "cached_tokens", fallback=usage.get("cached_tokens")
+            )
+            cache_write_tokens += cls._usage_int(
+                details,
+                "cache_write_tokens",
+                fallback=usage.get("cache_write_tokens"),
+            )
+        aggregate["input_tokens_details"] = {
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
+        }
+
+        merged = dict(body)
+        merged["usage"] = aggregate
+        return merged
+
+    @staticmethod
+    def _usage_int(
+        usage: dict,
+        primary: str,
+        alternate: str | None = None,
+        *,
+        fallback=None,
+    ) -> int:
+        value = usage.get(primary)
+        if not value and alternate:
+            value = usage.get(alternate)
+        if not value:
+            value = fallback
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_reasoning_budget_exhausted(body: dict) -> bool:
+        """判断响应是否为“思考耗尽预算、正文为空”。"""
+
+        choices = body.get("choices") or []
+        if not choices:
+            return False
+        choice = choices[0]
+        if choice.get("finish_reason") != "length":
+            return False
+        if (choice.get("message") or {}).get("content"):
+            return False
+        usage = body.get("usage") or {}
+        completion = usage.get("output_tokens") or usage.get("completion_tokens")
+        details = (
+            usage.get("output_tokens_details")
+            or usage.get("completion_tokens_details")
+            or {}
+        )
+        reasoning = details.get("reasoning_tokens")
+        if not isinstance(completion, int) or not isinstance(reasoning, int):
+            return False
+        return completion > 0 and reasoning >= completion
 
     def _build_payload(
         self, messages: list[LLMMessage], params: LLMRequestParams

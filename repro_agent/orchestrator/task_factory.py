@@ -100,6 +100,20 @@ STANDARD_TOOL_TEMPLATES: dict[str, list[str]] = {
     ],
 }
 
+# Initial report promises are role-aware.  Heavy environment/execution tasks
+# no longer inherit the same five-minute expectation as lightweight analysis.
+DEFAULT_EXPECTED_DURATION_SECONDS: dict[str, int] = {
+    "paper_analysis": 600,
+    "code_analysis": 900,
+    "resource_check": 300,
+    "specification": 300,
+    "environment_build": 1800,
+    "coding": 900,
+    "experiment_execution": 3600,
+    "verification": 600,
+    "reflection": 600,
+}
+
 
 _ALWAYS_KEEP_TOOLS = {"write_task_output"}
 """即使调用方传入了很窄的 ``restrict_tools``，也永远保留的工具。
@@ -169,6 +183,10 @@ def build_task_definition(
         base_tools = template
 
     allowed_tools = list(dict.fromkeys(base_tools + (extra_allowed_tools or [])))
+    kwargs.setdefault(
+        "expected_duration_seconds",
+        DEFAULT_EXPECTED_DURATION_SECONDS.get(task_type, 300),
+    )
 
     return TaskDefinition(
         objective=objective,

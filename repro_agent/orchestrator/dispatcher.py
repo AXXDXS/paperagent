@@ -16,7 +16,7 @@
        立即返回句柄而不阻塞——这是响应用户需求"子智能体运行期间必须
        能被主智能体轮询/强制查询/必要时强制终止"的前提：如果还是
        同步阻塞调用，主智能体在子智能体运行期间根本没有机会去做
-       "2 分钟未汇报则强制查询状态""判定死亡后强制终止"这些动作；
+       "预计时间到达后主动查询""三次延期后终止"这些动作；
     6. 捕获子智能体线程内的异常（含 ``ToolPermissionError``，即子
        智能体代码试图调用未授权工具的情况），转换为标准的
        ``AgentRunResult``/``FailureReport``，写回任务状态；
@@ -124,8 +124,8 @@ class SubAgentHandle:
            通道，必须由子智能体主动发起，本句柄从不替它编造心跳；
         3. 主智能体可以随时调用 ``pull_status()`` 主动查询当前状态
            （**pull** 通道）：正常情况下这只是"顺手看一眼"，只有当
-           ``LivenessPolicy`` 判定"超过宽限期没有 push"时，主循环
-           才会把这次 pull 的结果当作是否存活的关键证据；
+           动态报备截止时间到达而仍未收到最终结果时，主循环才会把
+           这次 pull 的结果作为延期或终止的关键证据；
         4. ``request_graceful_cancel()``：设置取消信号，子智能体在
            下一个检查点（``check_cancellation()``）会自行抛出
            ``CancellationRequested`` 并退出线程——这是"优雅终止"；
@@ -226,7 +226,19 @@ class SubAgentHandle:
         current = self.task.heartbeat
         progress = current.progress if current else 0.0
         current_step = current.current_step if current else "unknown"
-        eta = current.eta_seconds if current else None
+        report = self.task.latest_agent_report
+        progress = report.progress if report is not None else progress
+        elapsed = max(1.0, (utc_now() - self._started_at).total_seconds())
+        if 0.0 < progress < 1.0:
+            eta = elapsed * (1.0 - progress) / progress
+        else:
+            eta = float(self.task.definition.expected_duration_seconds)
+        if self.task.started_at is not None:
+            hard_remaining = max(
+                1.0,
+                float(self.task.definition.hard_timeout_seconds) - elapsed,
+            )
+            eta = min(eta, hard_remaining)
         return Heartbeat(
             progress=progress,
             current_step=f"{current_step} ({'alive' if alive else 'not_alive'})",
@@ -307,10 +319,8 @@ class AgentDispatcher:
         # 计入 max_tokens，必须从配置层透传，避免各调用点硬编码小额度。
         self.max_tokens = max_tokens
         self.llm_timeout_seconds = llm_timeout_seconds
-        # push 心跳落库回调：默认写 task.heartbeat（内存态）+ 落库，
-        # 由 MainAgent 在构造本类时注入真正的 scheduler.report_heartbeat，
-        # 这里给一个保底默认实现，保证单测/独立使用 dispatcher 时
-        # push 通道也不会因为回调缺失而报错。
+        # 窄通道回调：MainAgent 会分流业务报备和活动信号。保底实现仅
+        # 保存活动快照，供 Dispatcher 独立使用与单测。
         self._on_progress_push = on_progress_push or self._default_progress_push
         self._handles: dict[str, SubAgentHandle] = {}
         # ---- 运行期缺工具升级通道（工具分配权上收后新增） ----
@@ -450,7 +460,7 @@ class AgentDispatcher:
         )
 
         def _run() -> AgentRunResult:
-            # 自动的首尾 push 心跳：保证即便具体子智能体实现没有在
+            # 自动的首尾业务报备：保证即便具体子智能体实现没有在
             # run() 内部显式调用 report_progress()，也至少有"开始"和
             # "结束"两次由子智能体自己（通过其 report_progress 方法）
             # 发出的汇报，满足"必须保证一定是子智能体先主动汇报"的
@@ -459,17 +469,17 @@ class AgentDispatcher:
             # 不强制要求每个具体子智能体都手写汇报语句。子智能体如果
             # 想要更细粒度的中途进度，可以在自己的 run() 里多次调用
             # self.report_progress(...)，与这里的首尾汇报并不冲突。
-            agent.report_progress(0.0, "started")
+            agent.report_progress(
+                0.0,
+                "started",
+                eta_seconds=float(task.definition.expected_duration_seconds),
+            )
             try:
                 result = agent.run()
                 if result.succeeded:
                     result.reusable_code_candidates = (
                         agent.persist_reusable_code_candidates()
                     )
-                agent.report_progress(
-                    1.0 if result.succeeded else 0.0,
-                    "completed" if result.succeeded else "failed",
-                )
             except DestructiveActionConfirmationRequired as exc:
                 logger.warning(
                     "task %s paused before destructive command %s",
@@ -567,6 +577,11 @@ class AgentDispatcher:
                 )
             finally:
                 self._record_tool_invocations(task, authorization)
+            agent.report_progress(
+                1.0 if result.succeeded else 0.0,
+                "completed" if result.succeeded else "failed",
+                eta_seconds=0.0,
+            )
             return result
 
         handle._run_fn = _run  # noqa: SLF001 - 闭包需要访问上面刚构造的 authorization/agent
@@ -644,7 +659,7 @@ class AgentDispatcher:
             f"{_bounded_text(_json.dumps(arguments_summary or {}, ensure_ascii=False, default=str), 300)}）"
         )
 
-        # 让主循环知道线程正在等裁决而不是卡死：推一条 push 心跳。
+        # 让主循环知道线程正在等裁决；这是活动证据，不续期业务报备。
         self._push_escalation_heartbeat(handle, task, f"waiting_for_tool_grant:{tool_name}")
         self.task_repo.record_event(
             task.job_id,
@@ -743,9 +758,6 @@ class AgentDispatcher:
                         f"task {task.task_id} cancelled while waiting for "
                         f"tool grant approval of '{tool_name}'"
                     )
-                self._push_escalation_heartbeat(
-                    handle, task, f"waiting_for_user_tool_approval:{tool_name}"
-                )
         finally:
             with self._escalations_lock:
                 self._pending_escalations.pop(task.task_id, None)
@@ -806,13 +818,13 @@ class AgentDispatcher:
         return True
 
     def _push_escalation_heartbeat(self, handle: SubAgentHandle, task: Task, step: str) -> None:
-        """升级等待期间的心跳：证明线程活着且在等裁决。"""
+        """升级等待状态的活动信号；不刷新动态报备截止时间。"""
 
         try:
             current = task.heartbeat
             handle.push_progress(
                 current.progress if current else 0.0,
-                step,
+                f"activity:{step}",
                 None,
             )
         except Exception:  # noqa: BLE001 - 心跳失败不能阻断裁决流程

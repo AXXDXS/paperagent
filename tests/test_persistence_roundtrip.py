@@ -10,7 +10,13 @@ from repro_agent.domain.enums import (
 )
 from repro_agent.domain.job import JobInputs, ReproductionJob
 from repro_agent.domain.reflection import ReflectionReport
-from repro_agent.domain.task import Heartbeat, Task, TaskDefinition
+from repro_agent.domain.task import (
+    AgentReport,
+    AgentReportType,
+    Heartbeat,
+    Task,
+    TaskDefinition,
+)
 from repro_agent.storage.database import Database
 from repro_agent.storage.repository import JobRepository, ReflectionRepository, TaskRepository
 
@@ -29,6 +35,7 @@ def test_task_roundtrip_preserves_behavior_affecting_fields(tmp_path: Path) -> N
             objective="persist all scheduling inputs",
             task_type="paper_analysis",
             liveness_grace_seconds=7,
+            max_overrun_reports=4,
             priority=9,
         ),
     )
@@ -37,6 +44,17 @@ def test_task_roundtrip_preserves_behavior_affecting_fields(tmp_path: Path) -> N
     task.last_push_heartbeat = Heartbeat(progress=0.4, reported_by="push", eta_seconds=12)
     task.last_pull_heartbeat = Heartbeat(progress=0.4, reported_by="pull", eta_seconds=10)
     task.heartbeat = task.last_push_heartbeat
+    task.latest_agent_report = AgentReport(
+        attempt_id="attempt_current",
+        report_type=AgentReportType.EXTENSION,
+        progress=0.4,
+        eta_seconds=12,
+        next_report_after_seconds=12,
+        sequence=2,
+    )
+    task.next_report_due_at = task.latest_agent_report.reported_at
+    task.report_sequence = 2
+    task.overrun_report_count = 1
 
     repo = TaskRepository(database)
     repo.save(task)
@@ -44,6 +62,7 @@ def test_task_roundtrip_preserves_behavior_affecting_fields(tmp_path: Path) -> N
 
     assert loaded is not None
     assert loaded.definition.liveness_grace_seconds == 7
+    assert loaded.definition.max_overrun_reports == 4
     assert loaded.definition.priority == 9
     assert loaded.active_attempt_id == "attempt_current"
     assert loaded.last_activity_signature == "log:42"
@@ -51,6 +70,11 @@ def test_task_roundtrip_preserves_behavior_affecting_fields(tmp_path: Path) -> N
     assert loaded.last_push_heartbeat.eta_seconds == 12
     assert loaded.last_pull_heartbeat.reported_by == "pull"
     assert loaded.last_pull_heartbeat.eta_seconds == 10
+    assert loaded.latest_agent_report.report_type == AgentReportType.EXTENSION
+    assert loaded.latest_agent_report.attempt_id == "attempt_current"
+    assert loaded.next_report_due_at == task.next_report_due_at
+    assert loaded.report_sequence == 2
+    assert loaded.overrun_report_count == 1
 
 
 def test_job_roundtrip_preserves_final_reproduction_status(tmp_path: Path) -> None:

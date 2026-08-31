@@ -42,12 +42,16 @@ class RuntimeAccountingService:
 
     def record_model_usage(self, params, response) -> None:
         usage = response.usage or {}
+        # 部分 OpenAI 兼容网关同时返回两套命名字段（input_tokens=0 但
+        # prompt_tokens=30647）：``get(key, default)`` 在键存在但值为 0 时
+        # 不会回退到备用字段，改用真值链取第一个非零值。
         input_tokens = int(
-            usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
+            usage.get("input_tokens") or usage.get("prompt_tokens") or 0
         )
         output_tokens = int(
-            usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
         )
+        request_count = max(1, int(usage.get("request_count") or 1))
         input_details = (
             usage.get("input_tokens_details")
             or usage.get("prompt_tokens_details")
@@ -69,7 +73,7 @@ class RuntimeAccountingService:
         with self._lock:
             self.job.model_input_tokens_used += input_tokens
             self.job.model_output_tokens_used += output_tokens
-            self.job.model_calls_made += 1
+            self.job.model_calls_made += request_count
             self.job.model_call_cost_usd += cost
             self.job_repo.save(self.job)
             self.task_repo.record_event(
@@ -80,6 +84,7 @@ class RuntimeAccountingService:
                     "model": params.model,
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
+                    "request_count": request_count,
                     "cached_tokens": cached_tokens,
                     "cache_write_tokens": cache_write_tokens,
                     "prompt_cache_key": params.prompt_cache_key,

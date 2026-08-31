@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from repro_agent.agents.base import AgentRunResult
 from repro_agent.domain.enums import TaskStatus
-from repro_agent.domain.task import Task
+from repro_agent.domain.task import AgentReport, AgentReportType, Task
 from repro_agent.orchestrator.dispatcher import SubAgentHandle
 from repro_agent.orchestrator.task_factory import build_task_definition
 
@@ -45,3 +45,22 @@ def test_sandbox_is_attempt_scoped(main_agent) -> None:
     assert first.root != second.root
     assert first.attempt_id == "attempt-current"
     assert second.attempt_id == "attempt-next"
+
+
+def test_old_attempt_report_cannot_renew_current_report_lease(main_agent) -> None:
+    task = _task(main_agent)
+    before = task.next_report_due_at
+
+    accepted = main_agent.scheduler.report_agent(
+        task.task_id,
+        AgentReport(
+            attempt_id="attempt-old",
+            report_type=AgentReportType.PROGRESS,
+            progress=0.9,
+            eta_seconds=999,
+        ),
+    )
+
+    assert accepted is False
+    assert task.latest_agent_report is None
+    assert task.next_report_due_at == before

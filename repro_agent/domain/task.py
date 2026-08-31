@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from typing import Any, Optional
 
 from repro_agent.domain.common import iso, new_id, utc_now
@@ -30,39 +31,75 @@ class TaskDefinition:
     soft_timeout_seconds: int = 600
     hard_timeout_seconds: int = 1200
     heartbeat_interval_seconds: int = 30
-    # 子智能体超过多久没有主动 push 心跳，主智能体判定为"未按要求汇报"，
-    # 从而触发强制状态查询（pull）。用户需求原文是"约 2 分钟"，这里
-    # 设为独立可配置字段而不是硬编码，默认 120 秒对齐需求原文，
-    # 同时允许单个任务按需调整（例如已知会长时间静默的重型任务）。
+    # 兼容旧任务快照；动态报备机制不再使用固定的存活宽限期做业务裁决。
+    # 底层活动信号与上层报备租约已经解耦，见 AgentReport。
     liveness_grace_seconds: int = 120
+    # 正常进度报告不消耗额度；只有预计完成时间到达后仍未完成、主 Agent
+    # 主动查询并批准继续时才累计一次。达到上限后终止，防止无限等待。
+    max_overrun_reports: int = 3
     failure_report_required: bool = True
     priority: int = 0
     max_attempts: int = 3
     parent_task_id: Optional[str] = None
 
 
+class AgentReportType(str, Enum):
+    """业务报备类型；底层活动使用独立的 ``ActivitySignal``。"""
+
+    STARTED = "started"
+    PROGRESS = "progress"
+    EXTENSION = "extension"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 @dataclass
-class Heartbeat:
-    """子智能体心跳（设计文档 §13.2）。
+class AgentReport:
+    """子/主 Agent 之间的结构化报备合同。
 
-    调度器依据心跳判断任务是否"卡死"：如果超过
-    ``heartbeat_interval_seconds`` 的若干倍仍未收到心跳，
-    但尚未到硬超时，则标记为疑似卡死并触发状态探测。
+    ``eta_seconds`` 是预计剩余时间，``next_report_after_seconds`` 是下次
+    必须报备的间隔。当前实现默认二者相同，但分开持久化，便于未来让
+    长实验在预计完成前主动发送阶段报告。``EXTENSION`` 只会在原截止
+    时间到达、主 Agent 主动 pull 且确认执行仍存活后产生。
+    """
 
-    ``reported_by`` 字段区分心跳的来源，用于满足"必须保证一定是
-    子智能体先主动汇报"这一约束：
-        - ``"push"``：子智能体运行线程主动调用
-          ``BaseSubAgent.report_progress()`` 写入的心跳，是正常、
-          被信任的心跳来源；
-        - ``"pull"``：主智能体在子智能体超过
-          ``heartbeat_interval_seconds * 4``（约 2 分钟量级，具体见
-          ``scheduler.subagent_liveness.LivenessPolicy``）仍未收到
-          ``push`` 心跳时，通过 ``get_subagent_status`` 主动查询得到
-          的状态快照。``pull`` 心跳只能证明"进程/线程还活着"，不能
-          替代子智能体自己上报的真实业务进度，因此
-          ``LivenessPolicy`` 在判定"是否已确认死亡"时只信任
-          ``push`` 心跳的新鲜度，``pull`` 心跳仅用于"这一次强制查询
-          本身是否成功"的记录，不会重置卡死计时。
+    attempt_id: str
+    report_type: AgentReportType
+    progress: float = 0.0
+    current_step: str = ""
+    eta_seconds: Optional[float] = None
+    next_report_after_seconds: Optional[float] = None
+    reason: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+    reported_at: datetime = field(default_factory=utc_now)
+    reported_by: str = "push"
+    sequence: int = 0
+    report_id: str = field(default_factory=lambda: new_id("report"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "report_id": self.report_id,
+            "attempt_id": self.attempt_id,
+            "sequence": self.sequence,
+            "report_type": self.report_type.value,
+            "progress": self.progress,
+            "current_step": self.current_step,
+            "eta_seconds": self.eta_seconds,
+            "next_report_after_seconds": self.next_report_after_seconds,
+            "reason": self.reason,
+            "evidence": self.evidence,
+            "reported_at": iso(self.reported_at),
+            "reported_by": self.reported_by,
+        }
+
+
+@dataclass
+class ActivitySignal:
+    """底层活动快照，只用于诊断线程/进程是否存在。
+
+    活动信号不会刷新 ``Task.next_report_due_at``，也不会清零或增加
+    ``overrun_report_count``。这样 Docker 日志、工具开始/结束等低层
+    信号不会冒充业务进度，更不会让长任务无限续命。
     """
 
     progress: float = 0.0
@@ -83,6 +120,10 @@ class Heartbeat:
             "eta_seconds": self.eta_seconds,
             "reported_by": self.reported_by,
         }
+
+
+# 公共兼容名：旧调用方仍可读取 Heartbeat，但其语义已收窄为活动快照。
+Heartbeat = ActivitySignal
 
 
 @dataclass
@@ -143,6 +184,13 @@ class Task:
     # Lease+心跳 Worker 归属模型，见 scheduler/lease.py 的说明）。
     lease_owner: Optional[str] = None
     lease_expires_at: Optional[datetime] = None
+    # 动态报备租约。最新状态保存在 Task payload，完整流水复用现有
+    # task_events，避免新增一套重复的报告表/状态机。
+    latest_agent_report: Optional[AgentReport] = None
+    next_report_due_at: Optional[datetime] = None
+    report_sequence: int = 0
+    overrun_report_count: int = 0
+    reporting_exhausted: bool = False
 
     # ---- 派生属性 ----
 
@@ -168,6 +216,8 @@ class Task:
             "attempt": self.attempt,
             "dependencies": self.dependencies,
             "assigned_agent": self.assigned_agent,
+            "next_report_due_at": iso(self.next_report_due_at),
+            "overrun_report_count": self.overrun_report_count,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -188,6 +238,7 @@ class Task:
             "hard_timeout_seconds": self.definition.hard_timeout_seconds,
             "heartbeat_interval_seconds": self.definition.heartbeat_interval_seconds,
             "liveness_grace_seconds": self.definition.liveness_grace_seconds,
+            "max_overrun_reports": self.definition.max_overrun_reports,
             "failure_report_required": self.definition.failure_report_required,
             "priority": self.definition.priority,
             "status": self.status.value,
@@ -214,4 +265,11 @@ class Task:
             "active_attempt_id": self.active_attempt_id,
             "lease_owner": self.lease_owner,
             "lease_expires_at": iso(self.lease_expires_at),
+            "latest_agent_report": self.latest_agent_report.to_dict()
+            if self.latest_agent_report
+            else None,
+            "next_report_due_at": iso(self.next_report_due_at),
+            "report_sequence": self.report_sequence,
+            "overrun_report_count": self.overrun_report_count,
+            "reporting_exhausted": self.reporting_exhausted,
         }

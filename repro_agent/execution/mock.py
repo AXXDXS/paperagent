@@ -32,17 +32,21 @@ class MockExecutionBackend:
         self, request: CondaEnvironmentBuildRequest
     ) -> CondaEnvironmentBuildResult:
         fingerprint = "0" * 64
+        environment_name = request.environment_name or "repro-environment"
+        environment_ref = f"conda://{fingerprint}/{environment_name}"
         return CondaEnvironmentBuildResult(
-            environment_ref=f"conda://{fingerprint}",
+            environment_ref=environment_ref,
             environment_digest=fingerprint,
             exit_code=0,
             stdout="mock Conda environment build completed",
             mock=True,
             cache_hit=False,
             environment_fingerprint=fingerprint,
-            cache_ref=f"conda://{fingerprint}",
+            cache_ref=environment_ref,
             package_manifest_digest=fingerprint,
-            environment_name=request.environment_name,
+            environment_name=environment_name,
+            selected_conda_source="mock-conda",
+            selected_pip_source="mock-pip",
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:

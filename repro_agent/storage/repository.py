@@ -31,7 +31,14 @@ from repro_agent.domain.reflection import (
     ReflectionHypothesis,
     ReflectionReport,
 )
-from repro_agent.domain.task import FailureReport, Heartbeat, Task, TaskDefinition
+from repro_agent.domain.task import (
+    AgentReport,
+    AgentReportType,
+    FailureReport,
+    Heartbeat,
+    Task,
+    TaskDefinition,
+)
 from repro_agent.domain.verification import VerificationRecord
 from repro_agent.storage.database import Database, dumps, loads
 from repro_agent.tools.base import ToolInvocationLog
@@ -327,6 +334,7 @@ class TaskRepository:
             hard_timeout_seconds=data.get("hard_timeout_seconds", 1200),
             heartbeat_interval_seconds=data.get("heartbeat_interval_seconds", 30),
             liveness_grace_seconds=data.get("liveness_grace_seconds", 120),
+            max_overrun_reports=data.get("max_overrun_reports", 3),
             failure_report_required=data.get("failure_report_required", True),
             priority=data.get("priority", 0),
             max_attempts=data.get("max_attempts", 3),
@@ -345,6 +353,27 @@ class TaskRepository:
                 reported_by=hb.get("reported_by", "push"),
             )
         heartbeat = parse_heartbeat(data.get("heartbeat"))
+        latest_agent_report = None
+        if data.get("latest_agent_report"):
+            report = data["latest_agent_report"]
+            latest_agent_report = AgentReport(
+                report_id=report.get("report_id") or new_id("report"),
+                attempt_id=report.get("attempt_id", ""),
+                sequence=report.get("sequence", 0),
+                report_type=AgentReportType(
+                    report.get("report_type", AgentReportType.PROGRESS.value)
+                ),
+                progress=report.get("progress", 0.0),
+                current_step=report.get("current_step", ""),
+                eta_seconds=report.get("eta_seconds"),
+                next_report_after_seconds=report.get(
+                    "next_report_after_seconds"
+                ),
+                reason=report.get("reason", ""),
+                evidence=report.get("evidence", {}),
+                reported_at=_parse_dt(report.get("reported_at")) or utc_now(),
+                reported_by=report.get("reported_by", "push"),
+            )
         failure_report = None
         if data.get("failure_report"):
             fr = data["failure_report"]
@@ -379,6 +408,11 @@ class TaskRepository:
             active_attempt_id=data.get("active_attempt_id", ""),
             lease_owner=data.get("lease_owner"),
             lease_expires_at=_parse_dt(data.get("lease_expires_at")),
+            latest_agent_report=latest_agent_report,
+            next_report_due_at=_parse_dt(data.get("next_report_due_at")),
+            report_sequence=data.get("report_sequence", 0),
+            overrun_report_count=data.get("overrun_report_count", 0),
+            reporting_exhausted=data.get("reporting_exhausted", False),
         )
         return task
 

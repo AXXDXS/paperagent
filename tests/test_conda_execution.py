@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 from repro_agent.agents.environment.agent import EnvironmentBuildAgent
+from repro_agent.cli.main import _build_config, build_parser
 from repro_agent.execution.backend import (
     CondaEnvironmentBuildRequest,
     ExecutionRequest,
@@ -20,6 +22,26 @@ def test_environment_name_defaults_to_readable_repository_directory() -> None:
     assert managed_environment_name("", "/projects/E-mem-main") == "e-mem-main"
     assert managed_environment_name("My E-mem", "/projects/ignored") == "my-e-mem"
     assert managed_environment_name("base", "/projects/ignored") == "repro-base"
+
+
+def test_new_conda_runs_default_to_the_standard_named_environment_directory(
+    tmp_path: Path,
+) -> None:
+    args = build_parser().parse_args(
+        [
+            "run",
+            "--paper-path",
+            str(tmp_path / "paper.txt"),
+            "--repository-path",
+            str(tmp_path / "repo"),
+            "--environment-backend",
+            "conda",
+        ]
+    )
+
+    config = _build_config(args)
+    assert Path(config.conda_env_root) == Path.home() / ".conda" / "envs"
+    assert config.mirror_policy == ""
 
 
 def _fake_conda(tmp_path: Path) -> Path:
@@ -42,6 +64,8 @@ if args and args[0] == "create":
             "#!{sys.executable}\\n"
             "import os, sys\\n"
             "if sys.argv[1:] == ['-m', 'pip', 'freeze']:\\n"
+            "    raise SystemExit(0)\\n"
+            "if sys.argv[1:3] == ['-m', 'pip'] and any(op in sys.argv for op in ('download', 'install')):\\n"
             "    raise SystemExit(0)\\n"
             "os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\\n"
         )
@@ -86,11 +110,13 @@ def test_conda_backend_builds_reuses_and_executes_opaque_environment(
 
     assert built.exit_code == 0
     assert built.environment_ref.startswith("conda://")
+    assert built.environment_ref.endswith("/emem")
     assert str(tmp_path) not in built.environment_ref
     assert len(built.environment_digest) == 64
     assert cached.cache_hit is True
     assert cached.environment_ref == built.environment_ref
     assert built.environment_name == "emem"
+    assert built.selected_conda_source == "offline"
     assert (tmp_path / "managed-envs" / "emem").is_dir()
     assert not (tmp_path / "managed-envs" / built.environment_fingerprint).exists()
 
@@ -114,7 +140,7 @@ def test_conda_backend_builds_reuses_and_executes_opaque_environment(
 
     assert execution.exit_code == 0
     assert execution.stdout.strip() == "conda runtime ok"
-    assert execution.image_digest == built.environment_ref.removeprefix("conda://")
+    assert execution.image_digest == built.environment_fingerprint
     state = json.loads((tmp_path / "execution.json").read_text(encoding="utf-8"))
     assert state["runtime"] == "conda"
     assert state["container_name"] == execution.container_name
@@ -155,7 +181,7 @@ def test_environment_agent_uses_conda_builder_without_generating_dockerfile() ->
     agent._attempt_id = "attempt-1"
     agent._read_dependency_files = lambda root: ({}, [])
     agent._analyze_dependencies = lambda root, hint, files: "standard library"
-    agent._generate_lockfile = lambda files: ""
+    agent._generate_lockfile = lambda files, **kwargs: ""
     agent._generate_import_smoke_test = lambda lockfile: "print('ok')\n"
     writes: list[str] = []
     agent._guarded_write_file = lambda path, content: writes.append(path)
@@ -167,14 +193,14 @@ def test_environment_agent_uses_conda_builder_without_generating_dockerfile() ->
     def build_conda(**kwargs):
         calls.append(kwargs)
         return {
-            "environment_ref": "conda://" + "a" * 64,
+            "environment_ref": "conda://" + "a" * 64 + "/emem",
             "environment_digest": "b" * 64,
             "exit_code": 0,
             "stdout": "created",
             "stderr": "",
             "cache_hit": False,
             "environment_fingerprint": "a" * 64,
-            "cache_ref": "conda://" + "a" * 64,
+            "cache_ref": "conda://" + "a" * 64 + "/emem",
             "package_manifest_digest": "c" * 64,
         }
 
@@ -192,13 +218,15 @@ def test_environment_agent_uses_conda_builder_without_generating_dockerfile() ->
             "environment_name": "emem",
             "wheel_dirs": [],
             "force_rebuild": False,
+            "repair_existing": False,
+            "base_environment_ref": "",
             "network_enabled": True,
         }
     ]
     assert "workspace://Dockerfile" not in writes
     assert result.outputs["environment_backend"] == "conda"
     assert result.outputs["environment_name"] == "emem"
-    assert result.outputs["environment_ref"] == "conda://" + "a" * 64
+    assert result.outputs["environment_ref"] == "conda://" + "a" * 64 + "/emem"
     assert result.outputs["import_test_passed"] is True
 
 
@@ -289,7 +317,9 @@ def test_named_conda_environment_migrates_legacy_hash_prefix_without_rebuild(
         network_enabled=False,
     )
     legacy = backend.build_conda_environment(legacy_request)
+    generated_prefix = tmp_path / "managed-envs" / "environment"
     legacy_prefix = tmp_path / "managed-envs" / legacy.environment_fingerprint
+    generated_prefix.rename(legacy_prefix)
     assert legacy_prefix.is_dir()
 
     named = backend.build_conda_environment(
@@ -303,10 +333,199 @@ def test_named_conda_environment_migrates_legacy_hash_prefix_without_rebuild(
     )
 
     assert named.cache_hit is True
-    assert named.environment_ref == legacy.environment_ref
+    assert named.environment_fingerprint == legacy.environment_fingerprint
+    assert named.environment_ref.endswith("/emem")
     assert named.environment_name == "emem"
     assert (tmp_path / "managed-envs" / "emem").is_dir()
     assert not legacy_prefix.exists()
+
+
+def test_name_bound_reference_never_resolves_to_duplicate_prefix(
+    tmp_path: Path,
+) -> None:
+    conda = _fake_conda(tmp_path)
+    requirements = tmp_path / "requirements.lock.txt"
+    requirements.write_text("", encoding="utf-8")
+    backend = CondaExecutionBackend(
+        environment_root=tmp_path / "managed-envs",
+        conda_binary=str(conda),
+    )
+    built = backend.build_conda_environment(
+        CondaEnvironmentBuildRequest(
+            task_id="environment",
+            attempt_id="attempt-1",
+            requirements_file=requirements,
+            environment_name="target-env",
+            network_enabled=False,
+        )
+    )
+    duplicate = tmp_path / "managed-envs" / "aaa-duplicate"
+    shutil.copytree(tmp_path / "managed-envs" / "target-env", duplicate)
+
+    assert backend._prefix_from_ref(built.environment_ref).name == "target-env"
+
+
+def test_legacy_reference_prefers_the_stable_name_over_attempt_derived_duplicates(
+    tmp_path: Path,
+) -> None:
+    conda = _fake_conda(tmp_path)
+    requirements = tmp_path / "requirements.lock.txt"
+    requirements.write_text("", encoding="utf-8")
+    backend = CondaExecutionBackend(
+        environment_root=tmp_path / "managed-envs",
+        conda_binary=str(conda),
+    )
+    built = backend.build_conda_environment(
+        CondaEnvironmentBuildRequest(
+            task_id="environment",
+            attempt_id="attempt-1",
+            requirements_file=requirements,
+            environment_name="e-mem-main",
+            network_enabled=False,
+        )
+    )
+    shutil.copytree(
+        tmp_path / "managed-envs" / "e-mem-main",
+        tmp_path / "managed-envs" / "7cdcd1700e145b40-0-repository",
+    )
+    legacy_ref = "conda://" + built.environment_fingerprint
+
+    assert backend._prefix_from_ref(legacy_ref).name == "e-mem-main"
+
+
+def test_runtime_dependency_repair_updates_existing_named_prefix_without_conda_create(
+    tmp_path: Path,
+) -> None:
+    conda = _fake_conda(tmp_path)
+    requirements = tmp_path / "requirements.lock.txt"
+    requirements.write_text("", encoding="utf-8")
+    backend = CondaExecutionBackend(
+        environment_root=tmp_path / "managed-envs",
+        conda_binary=str(conda),
+    )
+    commands: list[list[str]] = []
+    original_run = backend._run_build_command
+
+    def record_commands(command, **kwargs):
+        commands.append(list(command))
+        if "pip" in command and any(
+            operation in command for operation in ("download", "install")
+        ):
+            return backend._CommandResult(0, "package operation ok", "", "completed")
+        return original_run(command, **kwargs)
+
+    backend._run_build_command = record_commands
+    backend._provision_prefix = lambda prefix, request, **kwargs: ("", "", [], "")
+    backend._package_manifest = lambda prefix, timeout: json.dumps(
+        {"prefix": prefix.name, "requirements": requirements.read_text()}
+    )
+    initial = backend.build_conda_environment(
+        CondaEnvironmentBuildRequest(
+            task_id="environment",
+            attempt_id="attempt-1",
+            requirements_file=requirements,
+            environment_name="emem",
+            network_enabled=True,
+        )
+    )
+    requirements.write_text("requests\n", encoding="utf-8")
+    repaired = backend.build_conda_environment(
+        CondaEnvironmentBuildRequest(
+            task_id="environment-repair",
+            attempt_id="attempt-2",
+            requirements_file=requirements,
+            environment_name="emem",
+            repair_existing=True,
+            base_environment_ref=initial.environment_ref,
+            network_enabled=True,
+        )
+    )
+
+    create_commands = [command for command in commands if command[1:2] == ["create"]]
+    assert len(create_commands) == 1
+    assert repaired.exit_code == 0
+    assert repaired.environment_name == "emem"
+    assert repaired.environment_ref.endswith("/emem")
+    assert repaired.environment_ref != initial.environment_ref
+    assert (tmp_path / "managed-envs" / "emem").is_dir()
+
+
+def test_named_build_refuses_to_delete_an_unmanaged_conda_environment(
+    tmp_path: Path,
+) -> None:
+    conda = _fake_conda(tmp_path)
+    requirements = tmp_path / "requirements.lock.txt"
+    requirements.write_text("", encoding="utf-8")
+    unmanaged = tmp_path / "managed-envs" / "emem"
+    unmanaged.mkdir(parents=True)
+    sentinel = unmanaged / "user-data.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    backend = CondaExecutionBackend(
+        environment_root=tmp_path / "managed-envs",
+        conda_binary=str(conda),
+    )
+
+    try:
+        backend.build_conda_environment(
+            CondaEnvironmentBuildRequest(
+                task_id="environment",
+                attempt_id="attempt-1",
+                requirements_file=requirements,
+                environment_name="emem",
+                network_enabled=False,
+            )
+        )
+    except RuntimeError as exc:
+        assert "unmanaged Conda environment" in str(exc)
+    else:
+        raise AssertionError("unmanaged environment must not be replaced")
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_failed_rebuild_restores_the_previous_managed_environment(
+    tmp_path: Path,
+) -> None:
+    conda = _fake_conda(tmp_path)
+    requirements = tmp_path / "requirements.lock.txt"
+    requirements.write_text("", encoding="utf-8")
+    backend = CondaExecutionBackend(
+        environment_root=tmp_path / "managed-envs",
+        conda_binary=str(conda),
+    )
+    original = backend.build_conda_environment(
+        CondaEnvironmentBuildRequest(
+            task_id="environment",
+            attempt_id="attempt-1",
+            requirements_file=requirements,
+            environment_name="emem",
+            network_enabled=False,
+        )
+    )
+    original_marker = (
+        tmp_path / "managed-envs" / "emem" / ".repro_agent_environment.json"
+    ).read_text(encoding="utf-8")
+    backend._create_prefix_with_failover = lambda **kwargs: (
+        backend._CommandResult(1, "", "CondaHTTPError: HTTP 503", "completed"),
+        "tuna-main",
+        [],
+    )
+    failed = backend.build_conda_environment(
+        CondaEnvironmentBuildRequest(
+            task_id="environment",
+            attempt_id="attempt-2",
+            requirements_file=requirements,
+            environment_name="emem",
+            force_rebuild=True,
+            network_enabled=True,
+        )
+    )
+
+    assert failed.exit_code == 1
+    assert backend._prefix_from_ref(original.environment_ref).name == "emem"
+    assert (
+        tmp_path / "managed-envs" / "emem" / ".repro_agent_environment.json"
+    ).read_text(encoding="utf-8") == original_marker
+    assert not list((tmp_path / "managed-envs").glob(".repro-backup-*"))
 
 
 def test_resume_infers_persisted_conda_backend(job, tmp_path: Path, monkeypatch) -> None:

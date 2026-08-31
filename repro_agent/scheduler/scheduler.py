@@ -4,7 +4,7 @@
     - 维护任务 DAG 的就绪判定（依赖 domain.dag.TaskDAG）；
     - 控制并发槽位数量（``max_parallel_agents``）；
     - 按 §8.3 的优先级规则选择要派发的任务；
-    - 检查心跳与软/硬超时（§13.2-§13.4）；
+    - 持久化业务报备/活动信号并检查软/硬时间边界（§13.2-§13.4）；
     - 维护执行租约（借鉴 DeerFlow 的 Lease+心跳模型，见 lease.py）。
 
 调度器本身**不执行**任务（不调用任何子智能体/LLM），只负责"选择
@@ -24,9 +24,10 @@ from repro_agent.domain.common import utc_now
 from repro_agent.domain.common import new_id
 from repro_agent.domain.dag import TaskDAG
 from repro_agent.domain.enums import TaskStatus
-from repro_agent.domain.task import FailureReport, Task
+from repro_agent.domain.task import AgentReport, AgentReportType, FailureReport, Task
 from repro_agent.domain.enums import FailureType
 from repro_agent.scheduler.lease import LeaseManager
+from repro_agent.scheduler.agent_reporting import AgentReportingPolicy
 from repro_agent.scheduler.priority import rank_ready_tasks
 from repro_agent.scheduler.timeout_policy import TimeoutOutcome, TimeoutPolicy
 from repro_agent.storage.repository import TaskRepository
@@ -50,7 +51,6 @@ class SchedulingResult:
     dispatched: list[Task] = field(default_factory=list)
     soft_timeout_tasks: list[Task] = field(default_factory=list)
     hard_timeout_tasks: list[Task] = field(default_factory=list)
-    stalled_tasks: list[Task] = field(default_factory=list)
 
 
 class TaskScheduler:
@@ -70,6 +70,7 @@ class TaskScheduler:
         self.timeout_policy = TimeoutPolicy(
             heartbeat_stale_multiplier=self.config.heartbeat_stale_multiplier
         )
+        self.reporting_policy = AgentReportingPolicy()
         self._running_count = 0
         self._load_from_storage()
 
@@ -163,6 +164,9 @@ class TaskScheduler:
 
     def mark_terminal_failure(self, task: Task, reason: str = "") -> None:
         task.status = TaskStatus.TERMINAL_FAILURE
+        task.completed_at = utc_now()
+        task.next_report_due_at = None
+        self.lease_manager.release(task)
         self.task_repo.save_with_event(
             task,
             "terminal_failure",
@@ -197,6 +201,11 @@ class TaskScheduler:
         task.last_push_heartbeat = None
         task.last_pull_heartbeat = None
         task.last_activity_signature = ""
+        task.latest_agent_report = None
+        task.next_report_due_at = None
+        task.report_sequence = 0
+        task.overrun_report_count = 0
+        task.reporting_exhausted = False
         task.failure_report = None
         self.lease_manager.release(task)
         self.task_repo.save_with_event(
@@ -254,19 +263,18 @@ class TaskScheduler:
                 result.newly_blocked.append(task)
         return result
 
-    def check_heartbeats(self) -> None:
-        """§19 ``scheduler.check_heartbeats()``：仅刷新心跳新鲜度判定的前置状态。
-
-        真正的心跳数据由子智能体通过 ``report_heartbeat`` 写入，这里
-        不主动拉取（避免和沙箱执行耦合），只是一个显式的调用点，
-        便于未来接入"主动探测子进程存活"的实现而不改变主循环代码。
-        """
-
-        return None
-
     def report_heartbeat(self, task_id: str, heartbeat) -> None:
+        """Persist a low-level activity observation without renewing reports."""
+
         task = self.dag.get(task_id)
         if task is None:
+            return
+        if task.status not in {
+            TaskStatus.DISPATCHED,
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_FOR_INPUT,
+            TaskStatus.WAITING_FOR_PERMISSION,
+        }:
             return
         if heartbeat.reported_by == "push":
             task.last_push_heartbeat = heartbeat
@@ -275,8 +283,76 @@ class TaskScheduler:
             task.last_pull_heartbeat = heartbeat
         self.task_repo.save(task)
 
+    def report_agent(self, task_id: str, report: AgentReport) -> bool:
+        """Persist one structured business report for the active attempt.
+
+        The latest report is stored with the task and every accepted report is
+        appended to ``task_events``.  This reuses the existing persistence and
+        recovery path instead of introducing a second report database.
+        """
+
+        task = self.dag.get(task_id)
+        if task is None:
+            return False
+        if report.attempt_id != task.active_attempt_id:
+            self.task_repo.record_event(
+                task.job_id,
+                task.task_id,
+                "stale_agent_report_rejected",
+                {
+                    "report_attempt_id": report.attempt_id,
+                    "active_attempt_id": task.active_attempt_id,
+                    "report_id": report.report_id,
+                },
+                event_key=f"stale-agent-report:{report.report_id}",
+            )
+            return False
+        if task.status not in {TaskStatus.DISPATCHED, TaskStatus.RUNNING}:
+            self.task_repo.record_event(
+                task.job_id,
+                task.task_id,
+                "closed_task_agent_report_rejected",
+                {
+                    "status": task.status.value,
+                    "attempt_id": report.attempt_id,
+                    "report_id": report.report_id,
+                },
+                event_key=f"closed-task-agent-report:{report.report_id}",
+            )
+            return False
+
+        task.report_sequence += 1
+        report.sequence = task.report_sequence
+        task.latest_agent_report = report
+        if report.report_type == AgentReportType.EXTENSION:
+            task.overrun_report_count += 1
+        if report.report_type in {
+            AgentReportType.COMPLETED,
+            AgentReportType.FAILED,
+        }:
+            task.next_report_due_at = None
+        else:
+            task.next_report_due_at = self.reporting_policy.next_deadline(
+                task, report, now=report.reported_at
+            )
+
+        self.task_repo.save_with_event(
+            task,
+            "agent_reported",
+            report.to_dict()
+            | {
+                "next_report_due_at": task.next_report_due_at.isoformat()
+                if task.next_report_due_at
+                else None,
+                "overrun_report_count": task.overrun_report_count,
+            },
+            event_key=f"agent-report:{report.report_id}",
+        )
+        self.dag.replace_task(task)
+        return True
+
     def check_timeouts(self) -> SchedulingResult:
-        """检查所有 RUNNING/DISPATCHED 任务的心跳与超时（§13.2-§13.4）。"""
+        """检查运行任务的软观测阈值与绝对硬超时。"""
 
         result = SchedulingResult()
         now = utc_now()
@@ -287,29 +363,6 @@ class TaskScheduler:
             if decision.outcome == TimeoutOutcome.HARD_TIMEOUT:
                 self._handle_hard_timeout(task, decision.detail)
                 result.hard_timeout_tasks.append(task)
-            elif decision.outcome == TimeoutOutcome.STALLED:
-                task.status = TaskStatus.SOFT_TIMEOUT
-                task.failure_report = FailureReport(
-                    failure_type=FailureType.AGENT_STALLED,
-                    failed_step=(
-                        task.heartbeat.current_step if task.heartbeat else "unknown"
-                    ),
-                    last_successful_step=(
-                        task.heartbeat.last_completed_step if task.heartbeat else ""
-                    ),
-                    error_message=decision.detail,
-                    likely_causes=["软超时后心跳或执行活动没有继续增长"],
-                    recommended_action="确认旧 attempt 已终止后再重试",
-                )
-                self.task_repo.save_with_event(
-                    task,
-                    "soft_timeout_stalled",
-                    {"detail": decision.detail, "attempt_id": task.active_attempt_id},
-                    event_key=f"soft-timeout:{task.task_id}:{task.active_attempt_id}",
-                )
-                self.dag.replace_task(task)
-                result.stalled_tasks.append(task)
-                result.soft_timeout_tasks.append(task)
             elif decision.outcome == TimeoutOutcome.SLOW_BUT_ALIVE:
                 result.soft_timeout_tasks.append(task)
                 logger.info("task %s slow but alive: %s", task.task_id, decision.detail)
@@ -382,10 +435,22 @@ class TaskScheduler:
             task.status = TaskStatus.DISPATCHED
             task.dispatched_at = now
             task.assigned_agent = owner
+            task.latest_agent_report = None
+            task.next_report_due_at = None
+            task.report_sequence = 0
+            task.overrun_report_count = 0
+            task.reporting_exhausted = False
             self.task_repo.save_with_event(
                 task,
                 "task_dispatched",
-                {"attempt_id": task.active_attempt_id, "owner": owner},
+                {
+                    "attempt_id": task.active_attempt_id,
+                    "owner": owner,
+                    "expected_duration_seconds": (
+                        task.definition.expected_duration_seconds
+                    ),
+                    "max_overrun_reports": task.definition.max_overrun_reports,
+                },
                 event_key=f"task-dispatched:{task.active_attempt_id}",
             )
             self.dag.replace_task(task)
@@ -395,10 +460,14 @@ class TaskScheduler:
     def mark_running(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         task.started_at = task.started_at or utc_now()
+        task.next_report_due_at = self.reporting_policy.initial_deadline(task)
         self.task_repo.save_with_event(
             task,
             "task_running",
-            {"attempt_id": task.active_attempt_id},
+            {
+                "attempt_id": task.active_attempt_id,
+                "next_report_due_at": task.next_report_due_at.isoformat(),
+            },
             event_key=f"task-running:{task.active_attempt_id}",
         )
         self.dag.replace_task(task)
@@ -407,6 +476,7 @@ class TaskScheduler:
         task.status = TaskStatus.SUCCEEDED
         task.completed_at = utc_now()
         task.outputs = outputs
+        task.next_report_due_at = None
         self.lease_manager.release(task)
         self.task_repo.save_with_event(
             task,
@@ -424,6 +494,7 @@ class TaskScheduler:
     ) -> None:
         task.status = status
         task.completed_at = utc_now()
+        task.next_report_due_at = None
         if failure_report is not None:
             task.failure_report = failure_report
         self.lease_manager.release(task)

@@ -56,8 +56,8 @@ flowchart TD
 关键通信通道如下：
 
 1. **任务下发**：Main Agent 从 DAG 取 READY 任务，经 Scheduler 分配 attempt 和 lease，再由 Dispatcher 创建对应角色实例。代码见 [`main_agent.py:365`](../repro_agent/orchestrator/main_agent.py#L365)、[`scheduler.py:264`](../repro_agent/scheduler/scheduler.py#L264)、[`dispatcher.py:283`](../repro_agent/orchestrator/dispatcher.py#L283)。
-2. **状态 push**：子 Agent 调用 `report_progress()`，经 `SubAgentHandle` 回调到 Main Agent，再写入 Scheduler/SQLite。代码见 [`base.py:227`](../repro_agent/agents/base.py#L227)、[`dispatcher.py:171`](../repro_agent/orchestrator/dispatcher.py#L171)、[`main_agent.py:547`](../repro_agent/orchestrator/main_agent.py#L547)。
-3. **状态 pull**：Main Agent 可调用 `get_subagent_status()` 读取线程存活状态及最后心跳。当前是同进程线程查询，不是 IPC/RPC。代码见 [`dispatcher.py:178`](../repro_agent/orchestrator/dispatcher.py#L178)、[`main_agent.py:567`](../repro_agent/orchestrator/main_agent.py#L567)。
+2. **业务报备 push**：子 Agent 调用 `report_progress()` 上报进度、当前步骤和 ETA；Scheduler 持久化 `AgentReport` 及下一报备截止时间。工具开始/结束只写 `ActivitySignal`，不会续期报备合同。
+3. **到期 pull**：预计完成时间到达但没有最终结果时，Main Agent 调用 `get_subagent_status()` 检查执行线程并取得新 ETA。当前是同进程线程查询，不是 IPC/RPC。
 4. **结果传递**：子 Agent 把 `result.json` 写进自己的 attempt 沙箱；主 Agent 验证后，`ArtifactResolver` 才把依赖任务的 payload 注入下游任务输入。代码见 [`results.py:38`](../repro_agent/schemas/results.py#L38)、[`artifacts.py:27`](../repro_agent/orchestrator/artifacts.py#L27)、[`main_agent.py:1332`](../repro_agent/orchestrator/main_agent.py#L1332)。
 5. **回收**：子 Agent 线程结束后句柄不会立即删除，必须先通过输出验证；最终裁决后才 `discard_handle()`。代码见 [`main_agent.py:376`](../repro_agent/orchestrator/main_agent.py#L376)、[`dispatcher.py:442`](../repro_agent/orchestrator/dispatcher.py#L442)。
 
@@ -65,7 +65,7 @@ flowchart TD
 
 ```text
 Main Agent -> TaskDefinition/授权工具/依赖 payload -> Sub Agent
-Sub Agent -> push 心跳/TaskResultEnvelope/沙箱产物 -> Main Agent
+Sub Agent -> AgentReport/ActivitySignal/TaskResultEnvelope/沙箱产物 -> Main Agent
 Main Agent -> 校验后的上游 payload -> 下游 Sub Agent
 ```
 
@@ -132,17 +132,18 @@ Dispatcher 为每个 task_id 保存独立 `SubAgentHandle`，每个 handle 启�
 
 边界是：系统没有按 GPU/内存做真实资源预约，也没有“根据复杂度自动调大 `max_parallel_agents`”。动态的是任务数量和依赖拓扑；并发上限仍是固定配置，默认 8，见 [`scheduler.py:38`](../repro_agent/scheduler/scheduler.py#L38)。
 
-### 3.5 心跳、超时、取消和 attempt 隔离
+### 3.5 动态报备、超时、取消和 attempt 隔离
 
-每个任务定义包含软超时、硬超时、心跳间隔、未 push 宽限期和最大重试次数，见 [`task.py:18`](../repro_agent/domain/task.py#L18)。运行链路为：
+每个任务定义包含角色相关的预计耗时、软/硬时间上限、最多延期报备次数和最大重试次数。运行链路为：
 
-1. Agent 启动和结束时由 Dispatcher 自动调用 `report_progress()`，形成至少两次 push 心跳，见 [`dispatcher.py:377`](../repro_agent/orchestrator/dispatcher.py#L377)。
-2. 主循环检查 push 是否过期；过期后强制 pull，读取线程是否仍活着，见 [`main_agent.py:589`](../repro_agent/orchestrator/main_agent.py#L589)、[`subagent_liveness.py:78`](../repro_agent/scheduler/subagent_liveness.py#L78)。
-3. 软超时后只要心跳新鲜、日志位置增长或资源探针活跃，就标记为 `SLOW_BUT_ALIVE`；硬超时则进入取消流程，见 [`timeout_policy.py:68`](../repro_agent/scheduler/timeout_policy.py#L68)。
-4. 取消先发 `threading.Event`；若无法确认线程退出，则不能安全并行重试旧任务，而会 fail closed，见 [`main_agent.py:734`](../repro_agent/orchestrator/main_agent.py#L734)。
-5. 每次派发产生新的 `active_attempt_id`。旧 attempt 的迟到结果会被拒绝，避免旧线程覆盖新结果，见 [`scheduler.py:273`](../repro_agent/scheduler/scheduler.py#L273)、[`main_agent.py:389`](../repro_agent/orchestrator/main_agent.py#L389)。
+1. Dispatcher 启动 Agent 时提交 `STARTED` 报告，预计耗时形成首次 `next_report_due_at`；具体 Agent 的阶段进度报告可用新 ETA 调整下次报备时间。
+2. 到达报备截止时间仍无最终结果时，Main Agent 主动 pull。线程仍存活则形成一次 `EXTENSION` 报告并按新 ETA 调整截止时间；普通进度不计入延期次数。
+3. 第三次延期仍未完成时，报备额度耗尽，任务进入终态取消，避免同一任务无限等待或自动重试。硬超时仍是独立、不可突破的资源安全上限；软超时只做观测告警，不再与报备机制重复判定卡死。
+4. 工具开始/结束、线程/容器存活等写入 `ActivitySignal`。它们可作为到期 pull 的诊断证据，但不会刷新报备截止时间，也不会修改延期次数。
+5. 所有取消统一走非阻塞流程：先设置 `threading.Event` 请求优雅退出，超过取消宽限期仍无法确认退出才强制停止并 fail closed。每次派发产生新的 `active_attempt_id`，旧 attempt 的迟到结果和迟到报告均被拒绝。
+6. 最新报备合同随 Task 持久化，完整报备历史复用 `task_events`；恢复时不接管已消失线程，重排任务会清空旧 attempt 的报备租约。
 
-当前限制：除基类和 Dispatcher 的启动/结束汇报外，10 个具体 Agent 没有调用 `report_progress()` 产生周期性中途心跳；`last_log_position` 也没有在实验运行中持续更新。因此当前更接近“开始/结束 push + 超时 pull 存活探测”，还不是训练长任务里的稳定周期性进度上报。Python 线程也无法被外部真正强杀；真正可强制停止的是 `execute_command` 启动的 Docker 容器。
+当前限制：Python 线程本身无法被外部真正强杀；真正可强制停止的是 `execute_command` 启动的容器/进程后端。业务进度精度也取决于具体 Agent 是否在阶段边界提供准确进度和 ETA，缺失时系统只能根据已完成比例和初始预计耗时保守推算。
 
 ### 3.6 DAG 实现中的已知语义问题
 
@@ -415,7 +416,7 @@ python -m pytest -q
 | 能力 | 测试 |
 |---|---|
 | 异步启动、push 心跳、验证后回收 | [`test_async_dispatch_and_validation.py:82`](../tests/test_async_dispatch_and_validation.py#L82) |
-| push 过期后的 pull、存活/死亡裁决 | [`test_liveness_and_termination.py:69`](../tests/test_liveness_and_termination.py#L69) |
+| 动态报备截止、到期 pull、三次延期终止 | [`test_liveness_and_termination.py`](../tests/test_liveness_and_termination.py) |
 | 五级门禁只创建紧邻下一层 | [`test_phase_coordinator.py:49`](../tests/test_phase_coordinator.py#L49) |
 | 正式实验后必须创建 verification | [`test_phase_coordinator.py:66`](../tests/test_phase_coordinator.py#L66) |
 | 无问题不重跑、确认问题才修复重跑 | [`test_reflection_loop.py:200`](../tests/test_reflection_loop.py#L200)、[`test_reflection_loop.py:237`](../tests/test_reflection_loop.py#L237) |
@@ -439,7 +440,7 @@ python -m pytest -q
 
 ### P1：提升长任务和多 Agent 的生产可靠性
 
-1. 为长命令增加周期性 progress/log offset/resource heartbeat，而不只在开始/结束 push。
+1. 为长命令增加可解释的阶段 progress、日志游标和更准确的 ETA；底层活动信号继续与业务报备分离。
 2. 将 Agent Worker 从不可强杀线程升级为可回收进程或远端 Worker；保留 lease、attempt 和 pull 接口。
 3. 将调度器升级为资源感知：GPU 数、显存、CPU、内存、预估耗时和角色配额都参与 admission control。
 4. 把 `max_audit_tasks_per_round`、GPU/模型费用的实时计量接入主循环。

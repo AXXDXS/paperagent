@@ -81,7 +81,7 @@ def _ready_task(main_agent: MainAgent) -> Task:
             task_type="experiment_execution",
             inputs={
                 "tier": "SMOKE_TEST",
-                "command": ["python", "train.py", "--smoke"],
+                "command": ["python", "train.py", "--smoke", "--model"],
                 "execution_image": "repro:test",
                 "working_dir": "workspace://repository",
                 "timeout_seconds": 120,

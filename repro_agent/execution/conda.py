@@ -2,8 +2,9 @@
 
 The backend keeps ReproAgent's task workspace/input/output separation, but it
 does not claim to provide a container security boundary.  Generated Conda
-prefixes live under one controller-owned root and are addressed by opaque
-``conda://<fingerprint>`` references rather than persisted host paths.
+prefixes live under one controller-owned root and are addressed by opaque,
+name-bound ``conda://<fingerprint>/<environment-name>`` references rather than
+persisted host paths.
 """
 
 from __future__ import annotations
@@ -31,8 +32,17 @@ from repro_agent.execution.backend import (
     ImageBuildResult,
 )
 from repro_agent.execution.environment_naming import managed_environment_name
+from repro_agent.execution.package_sources import (
+    PackageSource,
+    PackageSourcePolicy,
+    SourceFailureKind,
+    classify_source_failure,
+    source_attempt,
+)
 
-_CONDA_REF_RE = re.compile(r"^conda://([a-f0-9]{64})$")
+_CONDA_REF_RE = re.compile(
+    r"^conda://([a-f0-9]{64})(?:/([a-z0-9][a-z0-9._-]{0,62}))?$"
+)
 
 
 class CondaExecutionBackend:
@@ -49,13 +59,20 @@ class CondaExecutionBackend:
         *,
         environment_root: str | Path,
         conda_binary: str = "conda",
+        mirror_policy: str = "",
+        pip_index_urls: tuple[str, ...] = (),
+        conda_channels: tuple[str, ...] = (),
     ) -> None:
-        self.environment_root = Path(environment_root).resolve()
+        self.environment_root = Path(environment_root).expanduser().resolve()
         self.environment_root.mkdir(parents=True, exist_ok=True)
         self.conda_binary = conda_binary
+        self.mirror_policy = mirror_policy
+        self.pip_index_urls = pip_index_urls
+        self.conda_channels = conda_channels
         self._processes: dict[str, subprocess.Popen] = {}
         self._lock = threading.RLock()
         self._build_lock = threading.Lock()
+        self._source_unhealthy_until: dict[str, float] = {}
 
     def is_available(self) -> bool:
         return shutil.which(self.conda_binary) is not None
@@ -74,6 +91,20 @@ class CondaExecutionBackend:
         self, request: CondaEnvironmentBuildRequest
     ) -> CondaEnvironmentBuildResult:
         self.require_available(purpose="environment creation")
+        source_policy = (
+            PackageSourcePolicy.from_settings(
+                network_enabled=request.network_enabled,
+                mode=self.mirror_policy or "auto",
+                pip_index_urls=self.pip_index_urls,
+                conda_channels=self.conda_channels,
+            )
+            if self.mirror_policy or self.pip_index_urls or self.conda_channels
+            else PackageSourcePolicy.from_environment(
+                network_enabled=request.network_enabled
+            )
+        )
+        deadline = time.monotonic() + request.timeout_seconds
+        source_attempts: list[dict[str, object]] = []
         requirements = request.requirements_file.read_bytes()
         wheel_fingerprints = self._wheel_fingerprints(request.wheel_dirs)
         fingerprint = hashlib.sha256(
@@ -88,24 +119,29 @@ class CondaExecutionBackend:
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
-        environment_name = (
-            managed_environment_name(request.environment_name, request.task_id)
-            if request.environment_name
-            else ""
+        environment_name = managed_environment_name(
+            request.environment_name, request.task_id
         )
-        prefix = (
-            self._prefix_for_environment_name(environment_name)
-            if environment_name
-            else self._prefix_for_fingerprint(fingerprint)
-        )
+        prefix = self._prefix_for_environment_name(environment_name)
         marker = prefix / ".repro_agent_environment.json"
-        environment_ref = f"conda://{fingerprint}"
+        environment_ref = self._environment_ref(fingerprint, environment_name)
 
         with self._build_lock:
+            if request.repair_existing:
+                return self._repair_existing_environment(
+                    request=request,
+                    prefix=prefix,
+                    marker=marker,
+                    environment_name=environment_name,
+                    fingerprint=fingerprint,
+                    environment_ref=environment_ref,
+                    source_policy=source_policy,
+                    deadline=deadline,
+                )
             # One-time compatibility migration: an environment created by the
             # previous hash-directory implementation can be promoted to the
             # new readable project name without reinstalling dependencies.
-            if environment_name and not prefix.exists():
+            if not prefix.exists():
                 legacy_prefix = self._prefix_for_fingerprint(fingerprint)
                 legacy_marker = legacy_prefix / ".repro_agent_environment.json"
                 if self._valid_cache_marker(legacy_marker, fingerprint):
@@ -120,8 +156,21 @@ class CondaExecutionBackend:
                             json.dumps(metadata, sort_keys=True), encoding="utf-8"
                         )
             if not request.force_rebuild and self._valid_cache_marker(marker, fingerprint):
-                provision_stdout, provision_stderr = self._provision_prefix(prefix, request)
                 metadata = json.loads(marker.read_text(encoding="utf-8"))
+                selected_pip_source = str(metadata.get("selected_pip_source", ""))
+                provision_stdout, provision_stderr, provision_attempts, uv_source = self._provision_prefix(
+                    prefix,
+                    request,
+                    source_policy=source_policy,
+                    deadline=deadline,
+                    preferred_source_id=selected_pip_source,
+                )
+                if not selected_pip_source and uv_source:
+                    selected_pip_source = uv_source
+                    metadata["selected_pip_source"] = uv_source
+                    marker.write_text(
+                        json.dumps(metadata, sort_keys=True), encoding="utf-8"
+                    )
                 digest = str(metadata.get("environment_digest", ""))
                 return CondaEnvironmentBuildResult(
                     environment_ref=environment_ref,
@@ -129,8 +178,9 @@ class CondaExecutionBackend:
                     exit_code=0,
                     stdout=(
                         f"reused cached Conda environment "
-                        f"{environment_name or environment_ref} ({environment_ref})"
-                    ),
+                        f"{environment_name} ({environment_ref})\n{provision_stdout}"
+                    )[-request.max_log_bytes :],
+                    stderr=provision_stderr[-request.max_log_bytes :],
                     cache_hit=True,
                     environment_fingerprint=fingerprint,
                     cache_ref=environment_ref,
@@ -140,33 +190,32 @@ class CondaExecutionBackend:
                     environment_name=str(
                         metadata.get("environment_name", environment_name)
                     ),
+                    selected_conda_source=str(
+                        metadata.get("selected_conda_source", "")
+                    ),
+                    selected_pip_source=selected_pip_source,
+                    source_attempts=provision_attempts,
                 )
 
-            if prefix.exists():
-                self._remove_managed_prefix(prefix)
+            backup_prefix = self._backup_managed_prefix(
+                prefix, attempt_id=request.attempt_id
+            )
             prefix.parent.mkdir(parents=True, exist_ok=True)
 
-            create_command = [
-                self.conda_binary,
-                "create",
-                "--yes",
-                "--prefix",
-                str(prefix),
-                f"python={request.python_version}",
-                "pip",
-            ]
-            if not request.network_enabled:
-                create_command.append("--offline")
-            create = self._run_build_command(
-                create_command,
-                timeout_seconds=request.timeout_seconds,
-                cancellation_event=request.cancellation_event,
-                max_log_bytes=request.max_log_bytes,
+            create, selected_conda_source, conda_attempts = (
+                self._create_prefix_with_failover(
+                    prefix=prefix,
+                    request=request,
+                    policy=source_policy,
+                    deadline=deadline,
+                )
             )
+            source_attempts.extend(conda_attempts)
             stdout = create.stdout
             stderr = create.stderr
             if create.exit_code != 0:
-                self._remove_managed_prefix(prefix)
+                self._remove_managed_prefix(prefix, allow_unmarked=True)
+                self._restore_managed_backup(prefix, backup_prefix)
                 return CondaEnvironmentBuildResult(
                     environment_ref=environment_ref,
                     environment_digest="",
@@ -177,40 +226,26 @@ class CondaExecutionBackend:
                     environment_fingerprint=fingerprint,
                     cache_ref=environment_ref,
                     environment_name=environment_name,
+                    selected_conda_source=selected_conda_source,
+                    source_attempts=source_attempts,
                 )
 
+            selected_pip_source = ""
             if requirements.strip():
-                pip_command = [
-                    str(self._python_executable(prefix)),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--no-cache-dir",
-                ]
-                if request.wheel_dirs:
-                    pip_command.append("--no-index")
-                    for wheel_dir in request.wheel_dirs:
-                        pip_command.extend(["--find-links", str(wheel_dir)])
-                elif not request.network_enabled:
-                    pip_command.append("--no-index")
-                else:
-                    # PyPI 官方源在国内直连只有几 KB/s；允许通过环境变量
-                    # 持久化配置镜像（例如阿里云），避免依赖启动 shell 的
-                    # 临时 export。PIP_INDEX_URL 依然有效（pip 原生支持）。
-                    index_url = os.environ.get("REPRO_AGENT_PIP_INDEX_URL", "")
-                    if index_url:
-                        pip_command.extend(["--index-url", index_url])
-                pip_command.extend(["-r", str(request.requirements_file)])
-                install = self._run_build_command(
-                    pip_command,
-                    timeout_seconds=request.timeout_seconds,
-                    cancellation_event=request.cancellation_event,
-                    max_log_bytes=request.max_log_bytes,
+                install, selected_pip_source, pip_attempts = (
+                    self._install_requirements_with_failover(
+                        prefix=prefix,
+                        request=request,
+                        policy=source_policy,
+                        deadline=deadline,
+                    )
                 )
+                source_attempts.extend(pip_attempts)
                 stdout = (stdout + "\n" + install.stdout)[-request.max_log_bytes :]
                 stderr = (stderr + "\n" + install.stderr)[-request.max_log_bytes :]
                 if install.exit_code != 0:
-                    self._remove_managed_prefix(prefix)
+                    self._remove_managed_prefix(prefix, allow_unmarked=True)
+                    self._restore_managed_backup(prefix, backup_prefix)
                     return CondaEnvironmentBuildResult(
                         environment_ref=environment_ref,
                         environment_digest="",
@@ -221,16 +256,31 @@ class CondaExecutionBackend:
                         environment_fingerprint=fingerprint,
                         cache_ref=environment_ref,
                         environment_name=environment_name,
+                        selected_conda_source=selected_conda_source,
+                        selected_pip_source=selected_pip_source,
+                        source_attempts=source_attempts,
                     )
 
-            provision_stdout, provision_stderr = self._provision_prefix(prefix, request)
+            provision_stdout, provision_stderr, provision_attempts, uv_source = self._provision_prefix(
+                prefix,
+                request,
+                source_policy=source_policy,
+                deadline=deadline,
+                preferred_source_id=selected_pip_source,
+            )
+            source_attempts.extend(provision_attempts)
+            selected_pip_source = selected_pip_source or uv_source
             stdout = (stdout + "\n" + provision_stdout)[-request.max_log_bytes :]
             stderr = (stderr + "\n" + provision_stderr)[-request.max_log_bytes :]
 
             try:
-                manifest = self._package_manifest(prefix, request.timeout_seconds)
+                manifest_timeout = int(deadline - time.monotonic())
+                if manifest_timeout <= 0:
+                    raise subprocess.TimeoutExpired("package manifest", 0)
+                manifest = self._package_manifest(prefix, manifest_timeout)
             except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-                self._remove_managed_prefix(prefix)
+                self._remove_managed_prefix(prefix, allow_unmarked=True)
+                self._restore_managed_backup(prefix, backup_prefix)
                 return CondaEnvironmentBuildResult(
                     environment_ref=environment_ref,
                     environment_digest="",
@@ -243,6 +293,9 @@ class CondaExecutionBackend:
                     environment_fingerprint=fingerprint,
                     cache_ref=environment_ref,
                     environment_name=environment_name,
+                    selected_conda_source=selected_conda_source,
+                    selected_pip_source=selected_pip_source,
+                    source_attempts=source_attempts,
                 )
             manifest_digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
             environment_digest = hashlib.sha256(
@@ -255,11 +308,14 @@ class CondaExecutionBackend:
                         "environment_digest": environment_digest,
                         "package_manifest_digest": manifest_digest,
                         "environment_name": environment_name,
+                        "selected_conda_source": selected_conda_source,
+                        "selected_pip_source": selected_pip_source,
                     },
                     sort_keys=True,
                 ),
                 encoding="utf-8",
             )
+            self._discard_managed_backup(prefix, backup_prefix)
             return CondaEnvironmentBuildResult(
                 environment_ref=environment_ref,
                 environment_digest=environment_digest,
@@ -270,11 +326,607 @@ class CondaExecutionBackend:
                 cache_ref=environment_ref,
                 package_manifest_digest=manifest_digest,
                 environment_name=environment_name,
+                selected_conda_source=selected_conda_source,
+                selected_pip_source=selected_pip_source,
+                source_attempts=source_attempts,
             )
 
-    def _provision_prefix(
+    def _create_prefix_with_failover(
+        self,
+        *,
+        prefix: Path,
+        request: CondaEnvironmentBuildRequest,
+        policy: PackageSourcePolicy,
+        deadline: float,
+    ) -> tuple[_CommandResult, str, list[dict[str, object]]]:
+        if not request.network_enabled:
+            command = self._conda_create_command(prefix, request)
+            command.append("--offline")
+            result = self._run_with_deadline(command, request, deadline)
+            return result, "offline", []
+
+        attempts: list[dict[str, object]] = []
+        logs: list[str] = []
+        last_result = self._CommandResult(
+            125, "", "no approved Conda package source", "source_exhausted"
+        )
+        selected_source = ""
+        for source in self._ordered_sources(policy.conda_sources):
+            if prefix.exists():
+                self._remove_managed_prefix(prefix, allow_unmarked=True)
+            command = self._conda_create_command(prefix, request)
+            command[2:2] = ["--override-channels", "--channel", source.location]
+            result = self._run_with_deadline(
+                command, request, deadline, max_seconds=300
+            )
+            failure_kind = (
+                None
+                if result.exit_code == 0
+                else self._classify_attempt_failure(result, deadline)
+            )
+            attempts.append(
+                source_attempt(
+                    source,
+                    phase="conda_create",
+                    exit_code=result.exit_code,
+                    failure_kind=failure_kind,
+                )
+            )
+            logs.append(self._source_log(source, result, failure_kind))
+            last_result = result
+            selected_source = source.source_id
+            if result.exit_code == 0:
+                self._source_unhealthy_until.pop(source.source_id, None)
+                return (
+                    self._with_combined_logs(result, logs, request.max_log_bytes),
+                    selected_source,
+                    attempts,
+                )
+            may_failover = policy.may_failover(
+                source=source,
+                failure_kind=failure_kind or SourceFailureKind.UNKNOWN,
+            )
+            if may_failover:
+                self._source_unhealthy_until[source.source_id] = (
+                    time.monotonic() + 600
+                )
+            if not may_failover:
+                break
+        if prefix.exists():
+            self._remove_managed_prefix(prefix, allow_unmarked=True)
+        return (
+            self._with_combined_logs(last_result, logs, request.max_log_bytes),
+            selected_source,
+            attempts,
+        )
+
+    def _install_requirements_with_failover(
+        self,
+        *,
+        prefix: Path,
+        request: CondaEnvironmentBuildRequest,
+        policy: PackageSourcePolicy,
+        deadline: float,
+    ) -> tuple[_CommandResult, str, list[dict[str, object]]]:
+        if not request.network_enabled:
+            command = self._offline_pip_install_command(
+                prefix, request, download_dir=None
+            )
+            result = self._run_with_deadline(command, request, deadline)
+            return result, "offline", []
+
+        attempts: list[dict[str, object]] = []
+        logs: list[str] = []
+        last_result = self._CommandResult(
+            125, "", "no approved pip package source", "source_exhausted"
+        )
+        selected_source = ""
+        for source in self._ordered_sources(policy.pip_sources):
+            with tempfile.TemporaryDirectory(
+                prefix=".repro-download-", dir=self.environment_root
+            ) as download_root:
+                download_dir = Path(download_root)
+                command = [
+                    str(self._python_executable(prefix)),
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "download",
+                    "--dest",
+                    str(download_dir),
+                    "--retries",
+                    "2",
+                    "--timeout",
+                    "30",
+                    "--index-url",
+                    source.location,
+                ]
+                for wheel_dir in request.wheel_dirs:
+                    command.extend(["--find-links", str(wheel_dir)])
+                command.extend(["-r", str(request.requirements_file)])
+                downloaded = self._run_with_deadline(
+                    command, request, deadline, max_seconds=600
+                )
+                failure_kind = (
+                    None
+                    if downloaded.exit_code == 0
+                    else self._classify_attempt_failure(downloaded, deadline)
+                )
+                attempts.append(
+                    source_attempt(
+                        source,
+                        phase="pip_download",
+                        exit_code=downloaded.exit_code,
+                        failure_kind=failure_kind,
+                    )
+                )
+                logs.append(self._source_log(source, downloaded, failure_kind))
+                last_result = downloaded
+                selected_source = source.source_id
+                if downloaded.exit_code == 0:
+                    self._source_unhealthy_until.pop(source.source_id, None)
+                    install_command = self._offline_pip_install_command(
+                        prefix, request, download_dir=download_dir
+                    )
+                    installed = self._run_with_deadline(
+                        install_command, request, deadline
+                    )
+                    install_failure = (
+                        None
+                        if installed.exit_code == 0
+                        else classify_source_failure(
+                            installed.stderr, installed.stdout
+                        )
+                    )
+                    attempts.append(
+                        source_attempt(
+                            source,
+                            phase="pip_install_offline",
+                            exit_code=installed.exit_code,
+                            failure_kind=install_failure,
+                        )
+                    )
+                    logs.append(
+                        self._source_log(source, installed, install_failure)
+                    )
+                    return (
+                        self._with_combined_logs(
+                            installed, logs, request.max_log_bytes
+                        ),
+                        selected_source,
+                        attempts,
+                    )
+                may_failover = policy.may_failover(
+                    source=source,
+                    failure_kind=failure_kind or SourceFailureKind.UNKNOWN,
+                )
+                if may_failover:
+                    self._source_unhealthy_until[source.source_id] = (
+                        time.monotonic() + 600
+                    )
+                if not may_failover:
+                    break
+        return (
+            self._with_combined_logs(last_result, logs, request.max_log_bytes),
+            selected_source,
+            attempts,
+        )
+
+    def _conda_create_command(
         self, prefix: Path, request: CondaEnvironmentBuildRequest
-    ) -> tuple[str, str]:
+    ) -> list[str]:
+        return [
+            self.conda_binary,
+            "create",
+            "--yes",
+            "--prefix",
+            str(prefix),
+            f"python={request.python_version}",
+            "pip",
+        ]
+
+    def _offline_pip_install_command(
+        self,
+        prefix: Path,
+        request: CondaEnvironmentBuildRequest,
+        *,
+        download_dir: Path | None,
+    ) -> list[str]:
+        command = [
+            str(self._python_executable(prefix)),
+            "-m",
+            "pip",
+            "--isolated",
+            "install",
+            "--no-cache-dir",
+            "--no-index",
+        ]
+        if download_dir is not None:
+            command.extend(["--find-links", str(download_dir)])
+        for wheel_dir in request.wheel_dirs:
+            command.extend(["--find-links", str(wheel_dir)])
+        command.extend(["-r", str(request.requirements_file)])
+        return command
+
+    def _run_with_deadline(
+        self,
+        command: list[str],
+        request: CondaEnvironmentBuildRequest,
+        deadline: float,
+        max_seconds: int | None = None,
+    ) -> _CommandResult:
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            return self._CommandResult(
+                124, "", "environment build deadline exhausted", "timeout_killed"
+            )
+        timeout_seconds = max(1, remaining)
+        if max_seconds is not None:
+            timeout_seconds = min(timeout_seconds, max_seconds)
+        return self._run_build_command(
+            command,
+            timeout_seconds=timeout_seconds,
+            cancellation_event=request.cancellation_event,
+            max_log_bytes=request.max_log_bytes,
+        )
+
+    @staticmethod
+    def _classify_attempt_failure(
+        result: _CommandResult, deadline: float
+    ) -> SourceFailureKind:
+        if result.termination_reason in {
+            "cancelled_by_controller",
+            "log_limit_exceeded",
+        }:
+            return SourceFailureKind.LOCAL_FAILURE
+        if result.termination_reason == "timeout_killed":
+            return (
+                SourceFailureKind.UNAVAILABLE
+                if time.monotonic() < deadline
+                else SourceFailureKind.LOCAL_FAILURE
+            )
+        return classify_source_failure(result.stderr, result.stdout)
+
+    @staticmethod
+    def _source_location(
+        sources: tuple[PackageSource, ...], source_id: str
+    ) -> str:
+        selected = next(
+            (source.location for source in sources if source.source_id == source_id),
+            "",
+        )
+        return selected or (sources[0].location if sources else "")
+
+    def _ordered_sources(
+        self, sources: tuple[PackageSource, ...]
+    ) -> tuple[PackageSource, ...]:
+        now = time.monotonic()
+        return tuple(
+            sorted(
+                sources,
+                key=lambda source: (
+                    self._source_unhealthy_until.get(source.source_id, 0) > now,
+                    sources.index(source),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _source_log(
+        source: PackageSource,
+        result: _CommandResult,
+        failure_kind: SourceFailureKind | None,
+    ) -> str:
+        status = "success" if result.exit_code == 0 else (
+            failure_kind.value if failure_kind else "failed"
+        )
+        return f"package source {source.source_id} ({source.display_location}): {status}"
+
+    @classmethod
+    def _with_combined_logs(
+        cls,
+        result: _CommandResult,
+        logs: list[str],
+        max_log_bytes: int,
+    ) -> _CommandResult:
+        summary = "\n".join(logs)
+        return cls._CommandResult(
+            result.exit_code,
+            (summary + "\n" + result.stdout)[-max_log_bytes:],
+            (summary + "\n" + result.stderr)[-max_log_bytes:],
+            result.termination_reason,
+        )
+
+    def _repair_existing_environment(
+        self,
+        *,
+        request: CondaEnvironmentBuildRequest,
+        prefix: Path,
+        marker: Path,
+        environment_name: str,
+        fingerprint: str,
+        environment_ref: str,
+        source_policy: PackageSourcePolicy,
+        deadline: float,
+    ) -> CondaEnvironmentBuildResult:
+        """Install a dependency delta into one existing named environment.
+
+        The old marker is left untouched until installation, provisioning and
+        manifest capture all succeed.  Most importantly, this path never calls
+        ``conda create`` and never allocates an attempt-derived prefix.
+        """
+
+        base_match = _CONDA_REF_RE.fullmatch(request.base_environment_ref)
+        if base_match is None:
+            raise ValueError(
+                "repair_existing requires a valid base_environment_ref"
+            )
+        base_fingerprint, referenced_name = base_match.groups()
+        if referenced_name and referenced_name != environment_name:
+            raise ValueError(
+                "base environment reference does not match environment_name"
+            )
+        if not self._valid_cache_marker(marker, base_fingerprint):
+            raise RuntimeError(
+                f"existing Conda environment is unavailable or stale: {environment_name}"
+            )
+
+        previous_metadata = json.loads(marker.read_text(encoding="utf-8"))
+        selected_conda_source = str(
+            previous_metadata.get("selected_conda_source", "")
+        )
+        selected_pip_source = str(previous_metadata.get("selected_pip_source", ""))
+        source_attempts: list[dict[str, object]] = []
+        stdout = f"repairing existing Conda environment {environment_name}"
+        stderr = ""
+        requirements = request.requirements_file.read_bytes()
+        if requirements.strip():
+            install, selected_pip_source, pip_attempts = (
+                self._install_requirements_with_failover(
+                    prefix=prefix,
+                    request=request,
+                    policy=source_policy,
+                    deadline=deadline,
+                )
+            )
+            source_attempts.extend(pip_attempts)
+            stdout = (stdout + "\n" + install.stdout)[-request.max_log_bytes :]
+            stderr = install.stderr[-request.max_log_bytes :]
+            if install.exit_code != 0:
+                return CondaEnvironmentBuildResult(
+                    environment_ref=request.base_environment_ref,
+                    environment_digest="",
+                    exit_code=install.exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    termination_reason=install.termination_reason,
+                    environment_fingerprint=base_fingerprint,
+                    cache_ref=request.base_environment_ref,
+                    environment_name=environment_name,
+                    selected_conda_source=selected_conda_source,
+                    selected_pip_source=selected_pip_source,
+                    source_attempts=source_attempts,
+                )
+
+        provision_stdout, provision_stderr, provision_attempts, uv_source = self._provision_prefix(
+            prefix,
+            request,
+            source_policy=source_policy,
+            deadline=deadline,
+            preferred_source_id=selected_pip_source,
+        )
+        source_attempts.extend(provision_attempts)
+        selected_pip_source = selected_pip_source or uv_source
+        stdout = (stdout + "\n" + provision_stdout)[-request.max_log_bytes :]
+        stderr = (stderr + "\n" + provision_stderr)[-request.max_log_bytes :]
+        try:
+            manifest_timeout = int(deadline - time.monotonic())
+            if manifest_timeout <= 0:
+                raise subprocess.TimeoutExpired("package manifest", 0)
+            manifest = self._package_manifest(prefix, manifest_timeout)
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            return CondaEnvironmentBuildResult(
+                environment_ref=request.base_environment_ref,
+                environment_digest="",
+                exit_code=125,
+                stdout=stdout,
+                stderr=(stderr + f"\nfailed to capture package manifest: {exc}")[
+                    -request.max_log_bytes :
+                ],
+                termination_reason="manifest_capture_failed",
+                environment_fingerprint=base_fingerprint,
+                cache_ref=request.base_environment_ref,
+                environment_name=environment_name,
+                selected_conda_source=selected_conda_source,
+                selected_pip_source=selected_pip_source,
+                source_attempts=source_attempts,
+            )
+        manifest_digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+        environment_digest = hashlib.sha256(
+            f"{fingerprint}:{manifest_digest}".encode("utf-8")
+        ).hexdigest()
+        marker.write_text(
+            json.dumps(
+                {
+                    "environment_fingerprint": fingerprint,
+                    "environment_digest": environment_digest,
+                    "package_manifest_digest": manifest_digest,
+                    "environment_name": environment_name,
+                    "selected_conda_source": selected_conda_source,
+                    "selected_pip_source": selected_pip_source,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return CondaEnvironmentBuildResult(
+            environment_ref=environment_ref,
+            environment_digest=environment_digest,
+            exit_code=0,
+            stdout=stdout,
+            stderr=stderr,
+            environment_fingerprint=fingerprint,
+            cache_ref=environment_ref,
+            package_manifest_digest=manifest_digest,
+            environment_name=environment_name,
+            selected_conda_source=selected_conda_source,
+            selected_pip_source=selected_pip_source,
+            source_attempts=source_attempts,
+        )
+
+    def _install_uv_with_failover(
+        self,
+        *,
+        prefix: Path,
+        request: CondaEnvironmentBuildRequest,
+        policy: PackageSourcePolicy,
+        deadline: float,
+        preferred_source_id: str,
+    ) -> tuple[_CommandResult, str, list[dict[str, object]]]:
+        if not request.network_enabled:
+            command = [
+                str(self._python_executable(prefix)),
+                "-m",
+                "pip",
+                "--isolated",
+                "install",
+                "--no-cache-dir",
+                "--no-index",
+            ]
+            for wheel_dir in request.wheel_dirs:
+                command.extend(["--find-links", str(wheel_dir)])
+            command.append("uv")
+            return self._run_with_deadline(command, request, deadline), "offline", []
+
+        attempts: list[dict[str, object]] = []
+        logs: list[str] = []
+        last_result = self._CommandResult(
+            125, "", "no approved pip source for uv", "source_exhausted"
+        )
+        selected_source = ""
+        sources = self._prefer_source(
+            self._ordered_sources(policy.pip_sources), preferred_source_id
+        )
+        for source in sources:
+            with tempfile.TemporaryDirectory(
+                prefix=".repro-uv-download-", dir=self.environment_root
+            ) as download_root:
+                download_dir = Path(download_root)
+                download_command = [
+                    str(self._python_executable(prefix)),
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "download",
+                    "--dest",
+                    str(download_dir),
+                    "--retries",
+                    "2",
+                    "--timeout",
+                    "30",
+                    "--index-url",
+                    source.location,
+                    "uv",
+                ]
+                downloaded = self._run_with_deadline(
+                    download_command, request, deadline, max_seconds=180
+                )
+                failure_kind = (
+                    None
+                    if downloaded.exit_code == 0
+                    else self._classify_attempt_failure(downloaded, deadline)
+                )
+                attempts.append(
+                    source_attempt(
+                        source,
+                        phase="uv_download",
+                        exit_code=downloaded.exit_code,
+                        failure_kind=failure_kind,
+                    )
+                )
+                logs.append(self._source_log(source, downloaded, failure_kind))
+                last_result = downloaded
+                selected_source = source.source_id
+                if downloaded.exit_code == 0:
+                    install_command = [
+                        str(self._python_executable(prefix)),
+                        "-m",
+                        "pip",
+                        "--isolated",
+                        "install",
+                        "--no-cache-dir",
+                        "--no-index",
+                        "--find-links",
+                        str(download_dir),
+                        "uv",
+                    ]
+                    installed = self._run_with_deadline(
+                        install_command, request, deadline
+                    )
+                    install_failure = (
+                        None
+                        if installed.exit_code == 0
+                        else classify_source_failure(
+                            installed.stderr, installed.stdout
+                        )
+                    )
+                    attempts.append(
+                        source_attempt(
+                            source,
+                            phase="uv_install_offline",
+                            exit_code=installed.exit_code,
+                            failure_kind=install_failure,
+                        )
+                    )
+                    logs.append(
+                        self._source_log(source, installed, install_failure)
+                    )
+                    return (
+                        self._with_combined_logs(
+                            installed, logs, request.max_log_bytes
+                        ),
+                        selected_source,
+                        attempts,
+                    )
+                may_failover = policy.may_failover(
+                    source=source,
+                    failure_kind=failure_kind or SourceFailureKind.UNKNOWN,
+                )
+                if may_failover:
+                    self._source_unhealthy_until[source.source_id] = (
+                        time.monotonic() + 600
+                    )
+                if not may_failover:
+                    break
+        return (
+            self._with_combined_logs(last_result, logs, request.max_log_bytes),
+            selected_source,
+            attempts,
+        )
+
+    @staticmethod
+    def _prefer_source(
+        sources: tuple[PackageSource, ...], preferred_source_id: str
+    ) -> tuple[PackageSource, ...]:
+        if not preferred_source_id:
+            return sources
+        preferred = tuple(
+            source for source in sources if source.source_id == preferred_source_id
+        )
+        others = tuple(
+            source for source in sources if source.source_id != preferred_source_id
+        )
+        return preferred + others
+
+    def _provision_prefix(
+        self,
+        prefix: Path,
+        request: CondaEnvironmentBuildRequest,
+        *,
+        source_policy: PackageSourcePolicy,
+        deadline: float,
+        preferred_source_id: str = "",
+    ) -> tuple[str, str, list[dict[str, object]], str]:
         """Best-effort post-install provisioning shared by every environment.
 
         评测脚本普遍依赖 ``uv run`` 启动，而 nltk 语料不在任何 pip 包里；
@@ -287,23 +939,17 @@ class CondaExecutionBackend:
         """
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
-        uv_command = [
-            str(self._python_executable(prefix)),
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-        ]
-        index_url = os.environ.get("REPRO_AGENT_PIP_INDEX_URL", "")
-        if index_url:
-            uv_command.extend(["--index-url", index_url])
-        uv_command.append("uv")
+        source_attempts: list[dict[str, object]] = []
+        selected_source = ""
         try:
-            result = self._run_build_command(
-                uv_command,
-                timeout_seconds=request.timeout_seconds,
-                cancellation_event=request.cancellation_event,
-                max_log_bytes=request.max_log_bytes,
+            result, selected_source, source_attempts = (
+                self._install_uv_with_failover(
+                    prefix=prefix,
+                    request=request,
+                    policy=source_policy,
+                    deadline=deadline,
+                    preferred_source_id=preferred_source_id,
+                )
             )
         except (OSError, subprocess.SubprocessError) as exc:
             stderr_parts.append(f"warning: uv provisioning failed: {exc}")
@@ -312,6 +958,7 @@ class CondaExecutionBackend:
             stderr_parts.append(result.stderr)
             if result.exit_code != 0:
                 stderr_parts.append("warning: uv provisioning failed (non-fatal)")
+                selected_source = ""
         host_nltk = Path.home() / "nltk_data"
         if host_nltk.is_dir():
             try:
@@ -319,7 +966,12 @@ class CondaExecutionBackend:
                 stdout_parts.append(f"provisioned nltk_data into {prefix / 'nltk_data'}")
             except OSError as exc:
                 stderr_parts.append(f"warning: nltk_data copy failed: {exc}")
-        return "\n".join(stdout_parts), "\n".join(stderr_parts)
+        return (
+            "\n".join(stdout_parts),
+            "\n".join(stderr_parts),
+            source_attempts,
+            selected_source,
+        )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         self.require_available(purpose="experiment execution")
@@ -463,7 +1115,7 @@ class CondaExecutionBackend:
             stdout=stdout,
             stderr=stderr,
             container_name=identifier,
-            image_digest=request.image.removeprefix("conda://"),
+            image_digest=self._fingerprint_from_ref(request.image),
             termination_reason=termination_reason,
             started_at=started_at,
             completed_at=completed_at,
@@ -523,7 +1175,7 @@ class CondaExecutionBackend:
             expected_prefix = self._prefix_from_ref(
                 str(state.get("environment_ref", ""))
             )
-        except ValueError:
+        except (RuntimeError, ValueError):
             return False
         if prefix != str(expected_prefix):
             return False
@@ -550,8 +1202,17 @@ class CondaExecutionBackend:
     def _prefix_from_ref(self, environment_ref: str) -> Path:
         match = _CONDA_REF_RE.fullmatch(str(environment_ref))
         if match is None:
-            raise ValueError("Conda execution requires conda://<sha256> environment_ref")
-        fingerprint = match.group(1)
+            raise ValueError(
+                "Conda execution requires a valid conda:// environment_ref"
+            )
+        fingerprint, environment_name = match.groups()
+        if environment_name:
+            named_prefix = self._prefix_for_environment_name(environment_name)
+            if self._valid_cache_marker(
+                named_prefix / ".repro_agent_environment.json", fingerprint
+            ):
+                return named_prefix
+            return self._prefix_for_fingerprint(fingerprint)
         legacy_prefix = self._prefix_for_fingerprint(fingerprint)
         if self._valid_cache_marker(
             legacy_prefix / ".repro_agent_environment.json", fingerprint
@@ -561,6 +1222,7 @@ class CondaExecutionBackend:
         # Named prefixes keep the opaque fingerprint reference stable.  Resolve
         # it by validated marker so a renamed/rebuilt environment can never be
         # mistaken for the older dependency set.
+        matches: list[Path] = []
         for candidate in sorted(
             self.environment_root.iterdir(), key=lambda item: item.name
         ):
@@ -572,10 +1234,43 @@ class CondaExecutionBackend:
             if self._valid_cache_marker(
                 prefix / ".repro_agent_environment.json", fingerprint
             ):
-                return prefix
+                matches.append(prefix)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            # Compatibility for jobs created before references carried the
+            # stable environment name.  Old repair agents derived names from
+            # staged inputs such as ``<16-hex>-0-repository``.  If exactly one
+            # matching prefix is not attempt-derived, it is the original
+            # project environment and can be upgraded safely on the next build.
+            stable_matches = [
+                prefix
+                for prefix in matches
+                if re.fullmatch(
+                    r"[a-f0-9]{16}-\d+-repository", prefix.name
+                )
+                is None
+            ]
+            if len(stable_matches) == 1:
+                return stable_matches[0]
+            raise RuntimeError(
+                "legacy Conda environment reference is ambiguous; rebuild or "
+                "repair it once to obtain a name-bound reference"
+            )
         # Preserve the historical failure path: execute() will report that the
         # requested immutable environment is no longer available.
         return legacy_prefix
+
+    @staticmethod
+    def _environment_ref(fingerprint: str, environment_name: str) -> str:
+        return f"conda://{fingerprint}/{environment_name}"
+
+    @staticmethod
+    def _fingerprint_from_ref(environment_ref: str) -> str:
+        match = _CONDA_REF_RE.fullmatch(str(environment_ref))
+        if match is None:
+            raise ValueError("invalid Conda environment reference")
+        return match.group(1)
 
     def _prefix_for_fingerprint(self, fingerprint: str) -> Path:
         prefix = (self.environment_root / fingerprint).resolve()
@@ -591,11 +1286,80 @@ class CondaExecutionBackend:
             raise ValueError("invalid managed Conda environment name")
         return prefix
 
-    def _remove_managed_prefix(self, prefix: Path) -> None:
+    def _remove_managed_prefix(
+        self, prefix: Path, *, allow_unmarked: bool = False
+    ) -> None:
         if prefix.parent != self.environment_root:
             raise ValueError("refusing to remove unmanaged Conda prefix")
         if prefix.exists():
+            marker = prefix / ".repro_agent_environment.json"
+            if not allow_unmarked and not self._is_managed_marker(marker):
+                raise RuntimeError(
+                    f"refusing to replace an unmanaged Conda environment: {prefix.name}"
+                )
             shutil.rmtree(prefix)
+
+    def _backup_managed_prefix(
+        self, prefix: Path, *, attempt_id: str
+    ) -> Path | None:
+        if not prefix.exists():
+            return None
+        marker = prefix / ".repro_agent_environment.json"
+        if not self._is_managed_marker(marker, expected_name=prefix.name):
+            raise RuntimeError(
+                f"refusing to replace an unmanaged Conda environment: {prefix.name}"
+            )
+        safe_attempt = re.sub(r"[^A-Za-z0-9_.-]", "-", attempt_id)[-32:]
+        backup = self.environment_root / f".repro-backup-{prefix.name}-{safe_attempt}"
+        if backup.exists():
+            raise RuntimeError(f"stale Conda environment backup exists: {backup.name}")
+        prefix.rename(backup)
+        return backup
+
+    def _restore_managed_backup(
+        self, prefix: Path, backup: Path | None
+    ) -> None:
+        if backup is None:
+            return
+        if prefix.exists():
+            self._remove_managed_prefix(prefix, allow_unmarked=True)
+        if not self._is_managed_marker(
+            backup / ".repro_agent_environment.json", expected_name=prefix.name
+        ):
+            raise RuntimeError("refusing to restore an invalid Conda environment backup")
+        backup.rename(prefix)
+
+    def _discard_managed_backup(
+        self, prefix: Path, backup: Path | None
+    ) -> None:
+        if backup is None:
+            return
+        if not self._is_managed_marker(
+            backup / ".repro_agent_environment.json", expected_name=prefix.name
+        ):
+            raise RuntimeError("refusing to discard an invalid Conda environment backup")
+        shutil.rmtree(backup)
+
+    @staticmethod
+    def _is_managed_marker(
+        marker: Path, *, expected_name: str | None = None
+    ) -> bool:
+        if not marker.is_file():
+            return False
+        try:
+            value = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return all(
+            re.fullmatch(r"[a-f0-9]{64}", str(value.get(field, ""))) is not None
+            for field in (
+                "environment_fingerprint",
+                "environment_digest",
+                "package_manifest_digest",
+            )
+        ) and str(value.get("environment_name", "")) == (
+            expected_name or marker.parent.name
+        )
 
     def _valid_cache_marker(self, marker: Path, fingerprint: str) -> bool:
         if not marker.is_file() or not self._python_executable(marker.parent).is_file():

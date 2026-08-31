@@ -202,8 +202,10 @@ def test_create_subagents_is_a_main_only_batch_tool(main_agent, monkeypatch):
     assert task_b.status == TaskStatus.RUNNING
     assert main_agent.dispatcher.get_handle(task_a.task_id) is not None
     assert main_agent.dispatcher.get_handle(task_b.task_id) is not None
-    event = main_agent.task_repo.list_events(main_agent.job.job_id)[-1]
-    assert event["event_type"] == "create_subagents_tool_called"
+    events = main_agent.task_repo.list_events(main_agent.job.job_id)
+    event = next(
+        item for item in events if item["event_type"] == "create_subagents_tool_called"
+    )
     assert event["payload"]["started_task_ids"] == [task_a.task_id, task_b.task_id]
 
 

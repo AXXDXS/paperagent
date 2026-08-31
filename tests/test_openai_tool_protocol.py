@@ -12,7 +12,9 @@ from repro_agent.agents.base import BaseSubAgent
 from repro_agent.orchestrator.task_factory import build_task_definition
 from repro_agent.providers.base import (
     ContentBlock,
+    LLMMessage,
     LLMProviderError,
+    LLMRequestParams,
     LLMResponse,
     ToolCallRequest,
 )
@@ -73,6 +75,154 @@ def test_llm_http_error_omits_sensitive_response_body(monkeypatch) -> None:
 
     assert "response_format" in str(caught.value)
     assert reflected_secret not in str(caught.value)
+
+
+def test_reasoning_retry_aggregates_usage_and_physical_request_count(
+    monkeypatch,
+) -> None:
+    provider = OpenAICompatibleProvider(
+        api_base="https://gateway.example/v1",
+        api_key="not-used",
+    )
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {"content": ""},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 20,
+                    "completion_tokens_details": {"reasoning_tokens": 20},
+                    "prompt_tokens_details": {"cached_tokens": 2},
+                },
+            },
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"ok": true}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 7},
+            },
+        ]
+    )
+    sent_payloads: list[dict] = []
+
+    def fake_post(payload, _timeout):
+        sent_payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(provider, "_post_chat_completion", fake_post)
+    response = provider.complete(
+        [LLMMessage(role="user", content="return JSON")],
+        LLMRequestParams(model="reasoning-model", timeout_seconds=10),
+    )
+
+    assert response.content == '{"ok": true}'
+    assert sent_payloads[1]["reasoning_effort"] == "none"
+    assert response.usage["input_tokens"] == 15
+    assert response.usage["output_tokens"] == 27
+    assert response.usage["request_count"] == 2
+    assert response.usage["input_tokens_details"]["cached_tokens"] == 2
+
+
+def test_reasoning_retry_accepts_tool_call_output(monkeypatch) -> None:
+    provider = OpenAICompatibleProvider(
+        api_base="https://gateway.example/v1",
+        api_key="not-used",
+    )
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {"content": ""},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "completion_tokens": 4,
+                    "completion_tokens_details": {"reasoning_tokens": 4},
+                },
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path": "input://paper"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {},
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        provider,
+        "_post_chat_completion",
+        lambda _payload, _timeout: next(responses),
+    )
+
+    response = provider.complete(
+        [LLMMessage(role="user", content="inspect")],
+        LLMRequestParams(model="reasoning-model", timeout_seconds=10),
+    )
+
+    assert response.finish_reason == "tool_calls"
+    assert response.tool_calls[0].tool_name == "read_file"
+
+
+def test_reasoning_retry_respects_one_total_timeout_budget(monkeypatch) -> None:
+    provider = OpenAICompatibleProvider(
+        api_base="https://gateway.example/v1",
+        api_key="not-used",
+    )
+    body = {
+        "choices": [
+            {
+                "message": {"content": ""},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {
+            "completion_tokens": 4,
+            "completion_tokens_details": {"reasoning_tokens": 4},
+        },
+    }
+    calls: list[dict] = []
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(
+        "repro_agent.providers.openai_compatible.time.monotonic",
+        lambda: next(ticks),
+    )
+
+    def fake_post(payload, _timeout):
+        calls.append(payload)
+        return body
+
+    monkeypatch.setattr(provider, "_post_chat_completion", fake_post)
+    response = provider.complete(
+        [LLMMessage(role="user", content="inspect")],
+        LLMRequestParams(model="reasoning-model", timeout_seconds=1),
+    )
+
+    assert len(calls) == 1
+    assert response.usage["request_count"] == 1
 
 
 def test_all_builtin_tools_declare_machine_checkable_output_schema() -> None:

@@ -57,15 +57,16 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[float, str, "Optional[float]"], None]
 CheckpointReader = Callable[[str], dict[str, Any] | None]
 CheckpointWriter = Callable[[str, dict[str, Any]], None]
-"""子智能体主动上报进度的回调签名：``(progress, current_step, eta_seconds)``。
+"""子智能体主动上报的窄通道：``(progress, current_step, eta_seconds)``。
 
 由 ``AgentDispatcher`` 在启动子智能体线程时注入（见
 ``orchestrator/dispatcher.py::SubAgentHandle``），子智能体自身不直接
 持有调度器或任务仓库的引用——这与"子智能体只能通过
 ``ToolAuthorization`` 接触外部世界"的隔离原则是同一思路的延伸：
-进度上报是另一条独立于工具调用的窄通道，只能把
+业务报备和底层活动都经过这条独立于工具调用的窄通道，只能把
 ``(进度, 当前步骤, 预计剩余秒数)`` 这三个值向外传递，不能反向获得
-任何调度器状态。
+任何调度器状态。``current_step`` 以 ``activity:`` 开头时只作为底层
+活动证据，不刷新动态报备截止时间。
 """
 
 
@@ -224,8 +225,8 @@ class BaseSubAgent:
         # 提取）需要比默认更宽的超时，否则网络层会在模型还在生成时
         # 提前掐断连接。
         self._llm_timeout_seconds = llm_timeout_seconds
-        # push 心跳通道：由 SubAgentHandle 注入，子智能体主动调用
-        # report_progress() 汇报，不是被动等待主智能体来问。
+        # push 报备通道：由 SubAgentHandle 注入，子智能体主动调用
+        # report_progress()；activity 前缀只表示底层活动。
         self._progress_callback = progress_callback
         # 优雅取消信号：由 SubAgentHandle 在判定需要终止时 set()，
         # 子智能体应在长耗时循环/多步骤 run() 中调用
@@ -241,7 +242,7 @@ class BaseSubAgent:
         # children never receive the dynamic tool store or registry.
         self._reusable_code_candidates: list[dict[str, Any]] = []
 
-    # ---- 进度上报（push 心跳通道，见 orchestrator/dispatcher.py） ----
+    # ---- 业务报备与活动上报（见 orchestrator/dispatcher.py） ----
 
     def report_progress(
         self,
@@ -271,8 +272,24 @@ class BaseSubAgent:
                 self._progress_callback(progress, current_step, eta_seconds)
             except Exception:  # noqa: BLE001 - 上报失败不应打断任务本身
                 logger.exception(
-                    "task %s failed to push progress heartbeat", self.task.task_id
+                    "task %s failed to push progress report", self.task.task_id
                 )
+
+    def report_activity(self, current_step: str) -> None:
+        """发送一次底层活动信号，不续期业务报备合同。"""
+
+        if self._progress_callback is None:
+            return
+        heartbeat = getattr(self.task, "heartbeat", None)
+        progress = heartbeat.progress if heartbeat is not None else 0.0
+        try:
+            self._progress_callback(
+                progress, f"activity:{current_step}", None
+            )
+        except Exception:  # noqa: BLE001 - 诊断信号失败不应打断任务
+            logger.exception(
+                "task %s failed to push activity signal", self.task.task_id
+            )
 
     def check_cancellation(self) -> None:
         """探测主智能体是否已经发出（优雅）取消信号。
@@ -296,7 +313,7 @@ class BaseSubAgent:
 
         self.check_cancellation()
         try:
-            with self._tool_keepalive(tool_name):
+            with self._tool_activity(tool_name):
                 result = self._tools.call(tool_name, **kwargs)
         except ToolPermissionError:
             logger.error(
@@ -311,56 +328,14 @@ class BaseSubAgent:
         return result
 
     @contextmanager
-    def _tool_keepalive(self, tool_name: str) -> Iterator[None]:
-        """长工具调用期间的保活心跳（§13.3 活跃信号）。
+    def _tool_activity(self, tool_name: str) -> Iterator[None]:
+        """Emit event-based tool activity without a fixed keepalive thread."""
 
-        子智能体阻塞在单次 ``call_tool`` 内部（docker build、长时间
-        训练命令等）时无法主动 ``report_progress``，调度器会在软超时
-        后因"无心跳/无日志增长/无资源活动"误判 STALLED 并取消任务。
-        这里在工具执行期间由独立 daemon 线程按心跳节奏推送
-        ``tool:<name>`` 保活心跳，证明线程仍在推进；硬超时仍然兜底
-        （心跳新鲜只说明没死，不代表任务可以无限跑下去，
-        ``TimeoutPolicy`` 对此的注释仍成立）。
-        """
-
-        if self._progress_callback is None:
-            yield
-            return
-
-        stop = threading.Event()
-
-        def _beat() -> None:
-            interval = getattr(
-                getattr(self.task, "definition", None),
-                "heartbeat_interval_seconds",
-                30,
-            )
-            try:
-                interval = min(max(float(interval), 1.0), 60.0)
-            except (TypeError, ValueError):
-                interval = 30.0
-            while not stop.wait(interval):
-                heartbeat = getattr(self.task, "heartbeat", None)
-                progress = heartbeat.progress if heartbeat is not None else 0.0
-                try:
-                    self._progress_callback(progress, f"tool:{tool_name}", None)
-                except Exception:  # noqa: BLE001 - 心跳失败不能打断工具本身
-                    logger.exception(
-                        "task %s failed to push tool keepalive heartbeat",
-                        self.task.task_id,
-                    )
-
-        worker = threading.Thread(
-            target=_beat,
-            name=f"tool-keepalive-{self.task.task_id}",
-            daemon=True,
-        )
-        worker.start()
+        self.report_activity(f"tool_started:{tool_name}")
         try:
             yield
         finally:
-            stop.set()
-            worker.join(timeout=2.0)
+            self.report_activity(f"tool_finished:{tool_name}")
 
     def call_tool_checkpointed(
         self, checkpoint_key: str, tool_name: str, /, **kwargs: Any

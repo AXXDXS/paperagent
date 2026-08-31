@@ -146,7 +146,14 @@ def materialize_runtime_configuration(
     requirements: Iterable[Mapping[str, Any]],
     runtime_values: Mapping[str, Any],
 ) -> tuple[list[str], dict[str, str], list[str]]:
-    """Bind confirmed values to the exact command/environment invocation."""
+    """Bind confirmed values to the exact command/environment invocation.
+
+    A ``command_argument`` requirement is only bound when the command itself
+    already declares that argument (e.g. ``--config <placeholder>``).  Blindly
+    appending ``--config <value>`` to commands that never accepted it
+    (``compileall``/``pytest``) turns a configuration step into an immediate
+    argument-parser failure that looks like an environment defect.
+    """
 
     materialized_command = [str(part) for part in command]
     environment: dict[str, str] = {}
@@ -182,5 +189,7 @@ def _set_command_argument(command: list[str], argument: str, value: str) -> list
         if part.startswith(argument + "="):
             result[index] = f"{argument}={value}"
             return result
-    result.extend([argument, value])
+    # The command does not accept this argument; leave it untouched instead
+    # of appending an unrecognized flag that would break commands such as
+    # ``compileall`` or ``pytest``.
     return result

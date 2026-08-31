@@ -27,6 +27,7 @@ LLM 兜底分支（可选注入）：
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Optional
 
 from repro_agent.domain.enums import FailureDecision, FailureType
@@ -34,6 +35,18 @@ from repro_agent.domain.task import Task, TaskDefinition
 from repro_agent.orchestrator.task_factory import build_task_definition
 
 logger = logging.getLogger(__name__)
+
+_MISSING_MODULE_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError):\s*No module named\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+_IMPORT_TO_DISTRIBUTION = {
+    "bs4": "beautifulsoup4",
+    "cv2": "opencv-python",
+    "pil": "Pillow",
+    "sklearn": "scikit-learn",
+    "yaml": "PyYAML",
+}
 
 # 失败类型 -> 默认决策规则（§14 错误类型 + §19 主循环 decision 分支）。
 # 这是"确定性优先于 LLM 自由裁量"的一处具体体现：明确属于某一类的
@@ -227,8 +240,22 @@ class Replanner:
             or metadata.get("stdout_tail")
             or (failure.error_message if failure is not None else "")
         )
+        repair_dependencies = self._missing_runtime_dependencies(str(diagnostic))
+        environment_name = str(
+            failed_task.definition.inputs.get("environment_name", "")
+        ).strip()
+        base_environment_ref = str(
+            failed_task.definition.inputs.get("execution_image", "")
+        ).strip()
+        incremental_repair = bool(
+            repair_dependencies and base_environment_ref.startswith("conda://")
+        )
         definition = build_task_definition(
-            objective=f"重建并验证实验任务 {failed_task.task_id} 的运行环境",
+            objective=(
+                f"修复并验证实验任务 {failed_task.task_id} 的现有运行环境"
+                if incremental_repair
+                else f"重建并验证实验任务 {failed_task.task_id} 的运行环境"
+            ),
             task_type="environment_build",
             dependencies=list(failed_task.dependencies),
             inputs={
@@ -241,10 +268,16 @@ class Replanner:
                 "environment_backend": failed_task.definition.inputs.get(
                     "environment_backend", "docker"
                 ),
+                "environment_name": environment_name,
                 "python_version": failed_task.definition.inputs.get(
                     "python_version", "3.11"
                 ),
-                "force_rebuild": True,
+                "force_rebuild": not incremental_repair,
+                "repair_existing_environment": incremental_repair,
+                "base_environment_ref": (
+                    base_environment_ref if incremental_repair else ""
+                ),
+                "repair_dependencies": repair_dependencies,
                 "source_failed_task_id": failed_task.task_id,
                 "source_failed_attempt_id": failed_task.active_attempt_id,
                 "environment_repair": True,
@@ -259,6 +292,22 @@ class Replanner:
             max_attempts=min(3, failed_task.definition.max_attempts),
         )
         return Task(job_id=failed_task.job_id, definition=definition)
+
+    @staticmethod
+    def _missing_runtime_dependencies(diagnostic: str) -> list[str]:
+        """Extract a conservative pip repair list from Python import errors."""
+
+        dependencies: list[str] = []
+        for match in _MISSING_MODULE_RE.finditer(diagnostic):
+            top_level = match.group(1).split(".", 1)[0].strip()
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_]{0,127}", top_level):
+                continue
+            package = _IMPORT_TO_DISTRIBUTION.get(
+                top_level.lower(), top_level.replace("_", "-")
+            )
+            if package.lower() not in {item.lower() for item in dependencies}:
+                dependencies.append(package)
+        return dependencies
 
     def decompose(self, task: Task) -> list[Task]:
         """§19: ``main_agent.decompose(task)`` —— TASK_TOO_BROAD / CONTEXT_TOO_LARGE

@@ -179,6 +179,12 @@ def _build_provider(args: argparse.Namespace):
 
 
 def _build_config(args: argparse.Namespace) -> MainAgentConfig:
+    legacy_conda_root = Path(args.work_dir) / "conda_envs"
+    default_conda_root = (
+        legacy_conda_root
+        if getattr(args, "command", "") == "resume" and legacy_conda_root.is_dir()
+        else Path.home() / ".conda" / "envs"
+    )
     return MainAgentConfig(
         memory_root=f"{args.work_dir}/project_memory",
         sandbox_root=f"{args.work_dir}/sandbox",
@@ -193,9 +199,12 @@ def _build_config(args: argparse.Namespace) -> MainAgentConfig:
         conda_executable=getattr(args, "conda_executable", "conda"),
         conda_env_root=(
             getattr(args, "conda_env_root", None)
-            or f"{args.work_dir}/conda_envs"
+            or str(default_conda_root)
         ),
         conda_python_version=getattr(args, "conda_python_version", "3.11"),
+        mirror_policy=getattr(args, "mirror_policy", None) or "",
+        pip_index_urls=tuple(getattr(args, "pip_index_url", None) or ()),
+        conda_channels=tuple(getattr(args, "conda_channel", None) or ()),
         execution_image=getattr(args, "execution_image", "python:3.11-slim"),
         intervention_timeout_seconds=getattr(args, "hitl_timeout_seconds", None),
         # The bundled demo is intentionally a deterministic, non-executing
@@ -565,8 +574,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="环境和实验执行后端；指定 conda 可免除 Docker/Colima 依赖",
     )
     run_parser.add_argument("--conda-executable", default="conda", help="conda 或 mamba 可执行文件")
-    run_parser.add_argument("--conda-env-root", help="控制面管理的 Conda prefix 根目录")
+    run_parser.add_argument(
+        "--conda-env-root",
+        help="控制面管理的 Conda prefix 根目录（默认 ~/.conda/envs，可在 conda env list 中按名称显示）",
+    )
     run_parser.add_argument("--conda-python-version", default="3.11", help="Conda 环境 Python 版本")
+    run_parser.add_argument(
+        "--mirror-policy",
+        choices=("auto", "fixed", "offline"),
+        default=None,
+        help="Conda/pip 下载源策略：自动切换、固定首选源或完全离线",
+    )
+    run_parser.add_argument(
+        "--pip-index-url",
+        action="append",
+        help="允许的 pip HTTPS 源，可重复指定；auto 模式会追加内置公共兜底源",
+    )
+    run_parser.add_argument(
+        "--conda-channel",
+        action="append",
+        help="允许的 Conda HTTPS channel，可重复指定",
+    )
     run_parser.add_argument("--execution-image", default="python:3.11-slim", help="预先拉取的基础执行镜像（建议使用 digest）")
     run_parser.add_argument("--model-input-cost-per-million-usd", type=float, default=0.0)
     run_parser.add_argument("--model-output-cost-per-million-usd", type=float, default=0.0)
@@ -608,8 +636,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="恢复任务使用的环境和实验执行后端",
     )
     resume_parser.add_argument("--conda-executable", default="conda", help="conda 或 mamba 可执行文件")
-    resume_parser.add_argument("--conda-env-root", help="原运行使用的 Conda prefix 根目录")
+    resume_parser.add_argument(
+        "--conda-env-root", help="原运行使用的 Conda prefix 根目录"
+    )
     resume_parser.add_argument("--conda-python-version", default="3.11", help="Conda 环境 Python 版本")
+    resume_parser.add_argument(
+        "--mirror-policy",
+        choices=("auto", "fixed", "offline"),
+        default=None,
+        help="恢复任务使用的Conda/pip镜像切换策略",
+    )
+    resume_parser.add_argument("--pip-index-url", action="append")
+    resume_parser.add_argument("--conda-channel", action="append")
     resume_parser.add_argument(
         "--llm-timeout-seconds",
         type=float,

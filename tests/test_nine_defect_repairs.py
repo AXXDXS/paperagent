@@ -41,6 +41,8 @@ def _experiment(main_agent, failure_type: FailureType) -> Task:
                 "command": ["python", "train.py"],
                 "repository_path": main_agent.job.inputs.repository_path,
                 "execution_image": "repro:old",
+                "environment_backend": "conda",
+                "environment_name": "target-repo",
                 "environment_base_image": "python:3.11-slim",
                 "working_dir": "workspace://repository",
                 "creation_key": f"test:{failure_type.value}",
@@ -53,11 +55,11 @@ def _experiment(main_agent, failure_type: FailureType) -> Task:
     task.failure_report = FailureReport(
         failure_type=failure_type,
         failed_step="execute",
-        error_message="ModuleNotFoundError: missing dependency",
+        error_message="ModuleNotFoundError: No module named 'requests'",
         metadata={
             "command": ["python", "train.py"],
             "tier": ExperimentTier.SMOKE_TEST.value,
-            "stderr_tail": "ModuleNotFoundError: missing dependency",
+            "stderr_tail": "ModuleNotFoundError: No module named 'requests'",
         },
     )
     main_agent.scheduler.add_tasks([task])
@@ -99,6 +101,37 @@ def test_cuda_oom_and_exit_137_are_resource_failures() -> None:
             metrics_required=False,
         )
         assert report.failure_type == FailureType.RESOURCE_EXCEEDED
+
+
+def test_nonzero_missing_module_is_an_environment_failure() -> None:
+    result = ExperimentExecutionResult(
+        tier=ExperimentTier.SMOKE_TEST.value,
+        command=["python", "train.py"],
+        exit_code=1,
+        stderr_tail=(
+            "Traceback (most recent call last):\n"
+            "ModuleNotFoundError: No module named 'requests'"
+        ),
+        termination_reason="completed",
+    )
+    report = ExperimentExecutionAgent._failure_report_for_unsuccessful_execution(
+        result,
+        tier=ExperimentTier.SMOKE_TEST,
+        metrics_required=False,
+        masked_failure="",
+    )
+    assert report.failure_type == FailureType.ENVIRONMENT_ERROR
+
+    # A real non-zero import failure reaches the environment-repair route even
+    # when Python includes a normal traceback header.
+    result.stderr_tail = "ModuleNotFoundError: No module named 'requests'"
+    report = ExperimentExecutionAgent._failure_report_for_unsuccessful_execution(
+        result,
+        tier=ExperimentTier.SMOKE_TEST,
+        metrics_required=False,
+        masked_failure="",
+    )
+    assert report.failure_type == FailureType.ENVIRONMENT_ERROR
 
 
 def test_task_resource_limits_reach_the_sandbox_policy(tmp_path: Path) -> None:
@@ -173,6 +206,7 @@ def test_environment_failure_creates_one_rebuild_prerequisite_and_resumes(
     assert environment is not None
     assert environment.definition.task_type == "environment_build"
     assert environment.definition.inputs["force_rebuild"] is True
+    assert environment.definition.inputs["environment_name"] == "target-repo"
     duplicate_experiments = [
         task
         for task in main_agent.scheduler.dag.all_tasks()
@@ -195,6 +229,24 @@ def test_environment_failure_creates_one_rebuild_prerequisite_and_resumes(
 
     assert failed.status == TaskStatus.PENDING
     assert failed.definition.inputs["execution_image"] == "sha256:" + "b" * 64
+
+
+def test_missing_module_repairs_the_existing_conda_environment(main_agent) -> None:
+    failed = _experiment(main_agent, FailureType.ENVIRONMENT_ERROR)
+    failed.definition.inputs["execution_image"] = "conda://" + "a" * 64 + "/target-repo"
+
+    assert main_agent._handle_failed_task(failed) is False
+    repair = main_agent.scheduler.dag.get(
+        failed.definition.inputs["environment_repair_task_id"]
+    )
+    assert repair is not None
+    assert repair.definition.inputs["environment_name"] == "target-repo"
+    assert repair.definition.inputs["repair_dependencies"] == ["requests"]
+    assert repair.definition.inputs["repair_existing_environment"] is True
+    assert repair.definition.inputs["base_environment_ref"] == (
+        "conda://" + "a" * 64 + "/target-repo"
+    )
+    assert repair.definition.inputs["force_rebuild"] is False
 
 
 def test_decomposition_rewires_children_without_terminal_failure(main_agent) -> None:

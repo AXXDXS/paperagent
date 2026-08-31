@@ -1811,6 +1811,11 @@ class InterventionService:
         task.heartbeat = None
         task.last_push_heartbeat = None
         task.last_pull_heartbeat = None
+        task.latest_agent_report = None
+        task.next_report_due_at = None
+        task.report_sequence = 0
+        task.overrun_report_count = 0
+        task.reporting_exhausted = False
         task.failure_report = None
         task.last_activity_signature = ""
         task.lease_owner = None
